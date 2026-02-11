@@ -13,6 +13,7 @@ import (
 	"github.com/parsnips/dynamodb-local-faster/internal/backends"
 	"github.com/parsnips/dynamodb-local-faster/internal/catalog"
 	"github.com/parsnips/dynamodb-local-faster/internal/httpapi"
+	"github.com/parsnips/dynamodb-local-faster/internal/httpx"
 	"github.com/parsnips/dynamodb-local-faster/internal/metrics"
 	"github.com/parsnips/dynamodb-local-faster/internal/partiql"
 	"github.com/parsnips/dynamodb-local-faster/internal/router"
@@ -120,7 +121,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		return err
 	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := httpx.NewPooledClient(30 * time.Second)
 	streamMux := streams.NewMux(backendsList, streams.MakeProxyFunc(httpClient))
 
 	apiMux := http.NewServeMux()

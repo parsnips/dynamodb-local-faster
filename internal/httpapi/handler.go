@@ -18,6 +18,7 @@ import (
 
 	"github.com/parsnips/dynamodb-local-faster/internal/backends"
 	"github.com/parsnips/dynamodb-local-faster/internal/catalog"
+	"github.com/parsnips/dynamodb-local-faster/internal/httpx"
 	"github.com/parsnips/dynamodb-local-faster/internal/partiql"
 	"github.com/parsnips/dynamodb-local-faster/internal/router"
 	"github.com/parsnips/dynamodb-local-faster/internal/streams"
@@ -76,7 +77,7 @@ func NewHandler(
 		catalog: c,
 		streams: s,
 		parser:  p,
-		client:  &http.Client{Timeout: defaultProxyTimeout},
+		client:  httpx.NewPooledClient(defaultProxyTimeout),
 	}
 }
 

@@ -36,6 +36,68 @@ go test ./...
 go test -tags=integration ./pkg/dynolocalfaster -run TestManagedIntegrationAWSv2Modes -count=1
 ```
 
+## Benchmarking
+
+`BenchmarkWriteThroughput` is an integration benchmark that starts DynamoDB Local containers and compares:
+
+- direct single-backend writes
+- proxy single-backend writes
+- direct sharded writes across `N` backends
+- proxy writes across `N` backends
+
+### Run the benchmark
+
+```bash
+DLF_BENCH_WORKERS=100 go test -tags=integration -run='^$' -bench=BenchmarkWriteThroughput -benchtime=15s -count=1 -v ./pkg/dynolocalfaster
+```
+
+
+### Benchmark environment variables
+
+`DLF_BENCH_WORKERS`
+
+- Comma-separated positive integers.
+- Each value becomes a sub-benchmark (`workers-<value>`).
+- Sets the exact number of worker goroutines issuing requests.
+- Default when unset: `1,<numCPU>,<2*numCPU>`.
+
+Examples:
+
+```bash
+DLF_BENCH_WORKERS=10 go test -tags=integration -run='^$' -bench=BenchmarkWriteThroughput -benchtime=15s -count=1 -v ./pkg/dynolocalfaster
+DLF_BENCH_WORKERS=1,10,40 go test -tags=integration -run='^$' -bench=BenchmarkWriteThroughput -benchtime=15s -count=1 -v ./pkg/dynolocalfaster
+```
+
+`DLF_BENCH_LATENCY_SAMPLE_RATE`
+
+- Positive integer sample rate for latency percentiles.
+- `1` = sample every request (default).
+- `10` = sample every 10th request.
+- Use higher values to reduce overhead on long/high-throughput runs.
+
+Example:
+
+```bash
+DLF_BENCH_WORKERS=10 DLF_BENCH_LATENCY_SAMPLE_RATE=10 go test -tags=integration -run='^$' -bench=BenchmarkWriteThroughput -benchtime=15s -count=1 -v ./pkg/dynolocalfaster
+```
+
+### Reported metrics
+
+Each benchmark line includes:
+
+- `req/s`: throughput in requests per second.
+- `p50_ms`, `p95_ms`, `p99_ms`: sampled latency percentiles in milliseconds.
+- `latency_samples`: number of latency samples used for percentile calculations.
+- `errors`: number of requests that failed after retries.
+- `retries`: total retry attempts consumed.
+- `workers`: worker goroutine count used for that sub-benchmark.
+
+Example output line:
+
+```text
+BenchmarkWriteThroughput/workers-10/proxy-10-instances  336026  113952 ns/op  0 errors  33602 latency_samples  0.083 p50_ms  0.169 p95_ms  0.233 p99_ms  8776 req/s  0 retries  10.000 workers
+```
+
 ## Plan
 
 ### Goals
