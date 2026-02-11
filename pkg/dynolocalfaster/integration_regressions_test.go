@@ -126,6 +126,36 @@ func TestManagedRegressionExecuteStatementInsertWorks(t *testing.T) {
 	}
 }
 
+func TestManagedRegressionExecuteStatementInsertWithParametersWorks(t *testing.T) {
+	ctx, client := startManagedRegressionHarness(t, 2)
+	tableName := createRegressionTable(t, ctx, client, "it-reg-exec-insert-params")
+
+	_, err := client.ExecuteStatement(ctx, &dynamodb.ExecuteStatementInput{
+		Statement: aws.String(fmt.Sprintf(`INSERT INTO "%s" VALUE {'pk': ?, 'payload': ?}`, tableName)),
+		Parameters: []types.AttributeValue{
+			&types.AttributeValueMemberS{Value: "stmt-param-1"},
+			&types.AttributeValueMemberS{Value: "value-param-1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStatement(INSERT params) error = %v", err)
+	}
+
+	getOutput, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "stmt-param-1"},
+		},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("GetItem(stmt-param-1) error = %v", err)
+	}
+	if got := stringAttribute(getOutput.Item, "payload"); got != "value-param-1" {
+		t.Fatalf("GetItem(stmt-param-1).payload = %q, want %q", got, "value-param-1")
+	}
+}
+
 func startManagedRegressionHarness(t *testing.T, instances int) (context.Context, *dynamodb.Client) {
 	t.Helper()
 

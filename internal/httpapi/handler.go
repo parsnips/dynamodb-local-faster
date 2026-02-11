@@ -230,6 +230,21 @@ func (h *Handler) buildOperationRequest(op string, payload map[string]json.RawMe
 		}
 		request.PartitionKey = partitionKey
 		request.HasPartitionKey = hasPartitionKey
+	case "Query":
+		keyCondition := extractStringField(payload, "KeyConditionExpression")
+		if keyCondition != "" {
+			partitionKey, hasPartitionKey, err := h.partitionKeyFromQueryCondition(
+				tableName,
+				keyCondition,
+				payload["ExpressionAttributeValues"],
+				payload["ExpressionAttributeNames"],
+			)
+			if err != nil {
+				return router.OperationRequest{}, err
+			}
+			request.PartitionKey = partitionKey
+			request.HasPartitionKey = hasPartitionKey
+		}
 	case "ExecuteStatement":
 		statement, ok := payload["Statement"]
 		if !ok {
@@ -240,15 +255,39 @@ func (h *Handler) buildOperationRequest(op string, payload map[string]json.RawMe
 			return router.OperationRequest{}, fmt.Errorf("Statement must be a string")
 		}
 
-		parsedStatement, err := h.parser.Parse(statementText)
+		routingStatement := statementText
+		if parametersRaw, ok := payload["Parameters"]; ok {
+			var parameters []json.RawMessage
+			if err := json.Unmarshal(parametersRaw, &parameters); err != nil {
+				return router.OperationRequest{}, fmt.Errorf("Parameters must be an array")
+			}
+			substitutedStatement, substituteErr := substitutePartiqlParameters(statementText, parameters)
+			if substituteErr != nil {
+				return router.OperationRequest{}, substituteErr
+			}
+			routingStatement = substitutedStatement
+		}
+
+		parsedStatement, err := h.parser.Parse(routingStatement)
 		if err != nil {
 			return router.OperationRequest{}, err
 		}
 		statementRoute := &router.ParsedStatement{
-			TableName:       parsedStatement.TableName,
-			PartitionKey:    parsedStatement.PartitionKey,
-			HasPartitionKey: parsedStatement.HasPartitionKey,
-			ReadOnly:        parsedStatement.ReadOnly,
+			TableName: parsedStatement.TableName,
+			ReadOnly:  parsedStatement.ReadOnly,
+		}
+		if parsedStatement.HasPartitionKey {
+			keepPartitionKey := true
+			if parsedStatement.TableName != "" && parsedStatement.PartitionKeyAttribute != "" {
+				if knownPartitionKey, known := h.partitionKeyAttribute(parsedStatement.TableName); known &&
+					!strings.EqualFold(knownPartitionKey, parsedStatement.PartitionKeyAttribute) {
+					keepPartitionKey = false
+				}
+			}
+			if keepPartitionKey {
+				statementRoute.PartitionKey = parsedStatement.PartitionKey
+				statementRoute.HasPartitionKey = true
+			}
 		}
 		request.Statement = statementRoute
 	}
@@ -374,6 +413,55 @@ func (h *Handler) partitionKeyAttribute(tableName string) (string, bool) {
 		return "", false
 	}
 	return registry.PartitionKeyAttribute(tableName)
+}
+
+func (h *Handler) partitionKeyFromQueryCondition(
+	tableName string,
+	keyConditionExpression string,
+	rawExpressionAttributeValues json.RawMessage,
+	rawExpressionAttributeNames json.RawMessage,
+) ([]byte, bool, error) {
+	partitionKeyAttribute, known := h.partitionKeyAttribute(tableName)
+	if !known || strings.TrimSpace(partitionKeyAttribute) == "" {
+		return nil, false, nil
+	}
+
+	attrNameToken, attrValueToken, ok := parseQueryKeyConditionEquality(keyConditionExpression)
+	if !ok {
+		return nil, false, nil
+	}
+
+	nameAliases := make(map[string]string)
+	if len(bytes.TrimSpace(rawExpressionAttributeNames)) > 0 {
+		if err := json.Unmarshal(rawExpressionAttributeNames, &nameAliases); err != nil {
+			return nil, false, fmt.Errorf("ExpressionAttributeNames must be an object")
+		}
+	}
+	attrNameToken = resolveExpressionAttributeName(attrNameToken, nameAliases)
+	if !strings.EqualFold(strings.TrimSpace(attrNameToken), strings.TrimSpace(partitionKeyAttribute)) {
+		return nil, false, nil
+	}
+
+	if !strings.HasPrefix(attrValueToken, ":") {
+		return nil, false, nil
+	}
+	expressionValues := make(map[string]json.RawMessage)
+	if len(bytes.TrimSpace(rawExpressionAttributeValues)) == 0 {
+		return nil, false, fmt.Errorf("ExpressionAttributeValues is required for %s", attrValueToken)
+	}
+	if err := json.Unmarshal(rawExpressionAttributeValues, &expressionValues); err != nil {
+		return nil, false, fmt.Errorf("ExpressionAttributeValues must be an object")
+	}
+	attributeValueRaw, ok := expressionValues[attrValueToken]
+	if !ok {
+		return nil, false, fmt.Errorf("ExpressionAttributeValues is missing %s", attrValueToken)
+	}
+
+	partitionKey, err := canonicalizeRawJSON(attributeValueRaw)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid partition key value in ExpressionAttributeValues")
+	}
+	return partitionKey, true, nil
 }
 
 func (h *Handler) handleBatchGetItem(
@@ -1434,6 +1522,273 @@ func cloneAnyMap(input map[string]any) map[string]any {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func parseQueryKeyConditionEquality(expression string) (string, string, bool) {
+	expression = strings.TrimSpace(expression)
+	if expression == "" {
+		return "", "", false
+	}
+
+	andIdx := findKeywordOutsideQuotesForQuery(expression, "AND")
+	if andIdx >= 0 {
+		expression = strings.TrimSpace(expression[:andIdx])
+	}
+
+	eqIdx := findEqualityOutsideQuotesForQuery(expression)
+	if eqIdx <= 0 {
+		return "", "", false
+	}
+
+	left := strings.TrimSpace(expression[:eqIdx])
+	right := strings.TrimSpace(expression[eqIdx+1:])
+	if left == "" || right == "" {
+		return "", "", false
+	}
+
+	if strings.HasPrefix(left, ":") && !strings.HasPrefix(right, ":") {
+		return right, left, true
+	}
+	if !strings.HasPrefix(left, ":") && strings.HasPrefix(right, ":") {
+		return left, right, true
+	}
+	return left, right, false
+}
+
+func resolveExpressionAttributeName(nameToken string, aliases map[string]string) string {
+	nameToken = strings.TrimSpace(nameToken)
+	if nameToken == "" {
+		return ""
+	}
+	if strings.HasPrefix(nameToken, "#") {
+		if resolved, ok := aliases[nameToken]; ok {
+			return resolved
+		}
+	}
+	if strings.Contains(nameToken, ".") {
+		parts := strings.Split(nameToken, ".")
+		last := strings.TrimSpace(parts[len(parts)-1])
+		if strings.HasPrefix(last, "#") {
+			if resolved, ok := aliases[last]; ok {
+				return resolved
+			}
+		}
+		return last
+	}
+	return strings.Trim(nameToken, "\"")
+}
+
+func findKeywordOutsideQuotesForQuery(input string, keyword string) int {
+	keyword = strings.ToUpper(keyword)
+	if keyword == "" {
+		return -1
+	}
+
+	inSingleQuote := false
+	inDoubleQuote := false
+
+	for i := 0; i <= len(input)-len(keyword); i++ {
+		ch := input[i]
+		if inSingleQuote {
+			if ch == '\'' {
+				if i+1 < len(input) && input[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingleQuote = false
+			}
+			continue
+		}
+		if inDoubleQuote {
+			if ch == '"' {
+				if i+1 < len(input) && input[i+1] == '"' {
+					i++
+					continue
+				}
+				inDoubleQuote = false
+			}
+			continue
+		}
+
+		if ch == '\'' {
+			inSingleQuote = true
+			continue
+		}
+		if ch == '"' {
+			inDoubleQuote = true
+			continue
+		}
+
+		if !strings.EqualFold(input[i:i+len(keyword)], keyword) {
+			continue
+		}
+		beforeOK := i == 0 || !isIdentifierLikeRune(rune(input[i-1]))
+		afterPos := i + len(keyword)
+		afterOK := afterPos >= len(input) || !isIdentifierLikeRune(rune(input[afterPos]))
+		if beforeOK && afterOK {
+			return i
+		}
+	}
+
+	return -1
+}
+
+func findEqualityOutsideQuotesForQuery(input string) int {
+	inSingleQuote := false
+	inDoubleQuote := false
+
+	for i := 0; i < len(input); i++ {
+		ch := input[i]
+		if inSingleQuote {
+			if ch == '\'' {
+				if i+1 < len(input) && input[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingleQuote = false
+			}
+			continue
+		}
+		if inDoubleQuote {
+			if ch == '"' {
+				if i+1 < len(input) && input[i+1] == '"' {
+					i++
+					continue
+				}
+				inDoubleQuote = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingleQuote = true
+		case '"':
+			inDoubleQuote = true
+		case '=':
+			return i
+		}
+	}
+
+	return -1
+}
+
+func isIdentifierLikeRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '#'
+}
+
+func substitutePartiqlParameters(statement string, parameters []json.RawMessage) (string, error) {
+	if len(parameters) == 0 {
+		return statement, nil
+	}
+
+	var builder strings.Builder
+	inSingleQuote := false
+	inDoubleQuote := false
+	paramIndex := 0
+
+	for i := 0; i < len(statement); i++ {
+		ch := statement[i]
+		if inSingleQuote {
+			builder.WriteByte(ch)
+			if ch == '\'' {
+				if i+1 < len(statement) && statement[i+1] == '\'' {
+					builder.WriteByte(statement[i+1])
+					i++
+					continue
+				}
+				inSingleQuote = false
+			}
+			continue
+		}
+		if inDoubleQuote {
+			builder.WriteByte(ch)
+			if ch == '"' {
+				if i+1 < len(statement) && statement[i+1] == '"' {
+					builder.WriteByte(statement[i+1])
+					i++
+					continue
+				}
+				inDoubleQuote = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingleQuote = true
+			builder.WriteByte(ch)
+		case '"':
+			inDoubleQuote = true
+			builder.WriteByte(ch)
+		case '?':
+			if paramIndex >= len(parameters) {
+				return "", fmt.Errorf("missing parameter for PartiQL placeholder")
+			}
+			literal, err := partiqlParameterToLiteral(parameters[paramIndex])
+			if err != nil {
+				return "", err
+			}
+			builder.WriteString(literal)
+			paramIndex++
+		default:
+			builder.WriteByte(ch)
+		}
+	}
+
+	return builder.String(), nil
+}
+
+func partiqlParameterToLiteral(raw json.RawMessage) (string, error) {
+	attributeValue, err := decodePayloadObject(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid ExecuteStatement parameter")
+	}
+
+	if rawString, ok := attributeValue["S"]; ok {
+		var value string
+		if err := json.Unmarshal(rawString, &value); err != nil {
+			return "", fmt.Errorf("invalid string ExecuteStatement parameter")
+		}
+		return "'" + escapePartiqlSingleQuotedString(value) + "'", nil
+	}
+	if rawNumber, ok := attributeValue["N"]; ok {
+		var value string
+		if err := json.Unmarshal(rawNumber, &value); err != nil {
+			return "", fmt.Errorf("invalid number ExecuteStatement parameter")
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return "", fmt.Errorf("invalid number ExecuteStatement parameter")
+		}
+		return value, nil
+	}
+	if rawBool, ok := attributeValue["BOOL"]; ok {
+		var value bool
+		if err := json.Unmarshal(rawBool, &value); err != nil {
+			return "", fmt.Errorf("invalid BOOL ExecuteStatement parameter")
+		}
+		if value {
+			return "TRUE", nil
+		}
+		return "FALSE", nil
+	}
+	if rawNull, ok := attributeValue["NULL"]; ok {
+		var value bool
+		if err := json.Unmarshal(rawNull, &value); err != nil {
+			return "", fmt.Errorf("invalid NULL ExecuteStatement parameter")
+		}
+		if value {
+			return "NULL", nil
+		}
+		return "", fmt.Errorf("invalid NULL ExecuteStatement parameter")
+	}
+
+	return "", fmt.Errorf("unsupported ExecuteStatement parameter type")
+}
+
+func escapePartiqlSingleQuotedString(value string) string {
+	return strings.ReplaceAll(value, "'", "''")
 }
 
 func decodePayloadObject(body []byte) (map[string]json.RawMessage, error) {
