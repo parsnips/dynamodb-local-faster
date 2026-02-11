@@ -64,7 +64,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	}, nil
 }
 
-func (s *Server) Start(ctx context.Context) error {
+func (s *Server) Start(ctx context.Context) (err error) {
 	s.mu.Lock()
 	if s.started {
 		s.mu.Unlock()
@@ -73,15 +73,39 @@ func (s *Server) Start(ctx context.Context) error {
 	s.started = true
 	s.mu.Unlock()
 
+	managerStarted := false
+	startupCommitted := false
+	defer func() {
+		if startupCommitted {
+			return
+		}
+
+		s.state.SetReady(false)
+		s.setStarted(false)
+
+		if s.metricsServer != nil {
+			_ = s.metricsServer.Shutdown(context.Background())
+			s.metricsServer = nil
+			s.metricsListen = nil
+		}
+		if s.apiServer != nil {
+			_ = s.apiServer.Shutdown(context.Background())
+			s.apiServer = nil
+			s.apiListener = nil
+		}
+		if managerStarted {
+			_ = s.manager.Close(context.Background())
+		}
+	}()
+
 	backendsList, err := s.manager.Start(ctx)
 	if err != nil {
-		s.setStarted(false)
 		return err
 	}
+	managerStarted = true
 
 	backendRouter, err := router.NewStaticRouter(backendsList)
 	if err != nil {
-		s.setStarted(false)
 		return err
 	}
 
@@ -100,7 +124,6 @@ func (s *Server) Start(ctx context.Context) error {
 
 	apiListener, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
-		s.setStarted(false)
 		return fmt.Errorf("listen on %q: %w", s.cfg.ListenAddr, err)
 	}
 
@@ -118,9 +141,6 @@ func (s *Server) Start(ctx context.Context) error {
 
 		metricsListener, metricsErr := net.Listen("tcp", s.cfg.MetricsAddr)
 		if metricsErr != nil {
-			s.setStarted(false)
-			_ = s.apiServer.Shutdown(context.Background())
-			_ = s.manager.Close(context.Background())
 			return fmt.Errorf("listen on metrics addr %q: %w", s.cfg.MetricsAddr, metricsErr)
 		}
 
@@ -130,6 +150,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	s.state.SetReady(true)
+	startupCommitted = true
 	return nil
 }
 

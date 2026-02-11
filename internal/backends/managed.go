@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,6 +22,10 @@ const (
 	managedDynamoStateMountDir = "/home/dynamodblocal/data"
 	managedStartupTimeout      = 45 * time.Second
 	managedCleanupTimeout      = 20 * time.Second
+	managedAPIProbeTimeout     = 20 * time.Second
+	managedAPIProbeMinBackoff  = 100 * time.Millisecond
+	managedAPIProbeMaxBackoff  = 1 * time.Second
+	managedAPIRequestTimeout   = 2 * time.Second
 )
 
 type managedContainer interface {
@@ -39,6 +45,7 @@ type ManagedManager struct {
 
 	startContainer managedContainerStarter
 	probeHostPort  func(ctx context.Context, hostport string) error
+	probeAPI       func(ctx context.Context, endpoint string) error
 }
 
 func NewManagedManager(instances int, image string, stateDir string) *ManagedManager {
@@ -48,6 +55,7 @@ func NewManagedManager(instances int, image string, stateDir string) *ManagedMan
 		stateDir:       stateDir,
 		startContainer: defaultManagedContainerStarter,
 		probeHostPort:  probeHostPort,
+		probeAPI:       probeManagedAPI,
 	}
 }
 
@@ -80,6 +88,10 @@ func (m *ManagedManager) Start(ctx context.Context) ([]Backend, error) {
 	probe := m.probeHostPort
 	if probe == nil {
 		probe = probeHostPort
+	}
+	probeAPI := m.probeAPI
+	if probeAPI == nil {
+		probeAPI = probeManagedAPI
 	}
 
 	startedContainers := make([]managedContainer, 0, m.instances)
@@ -141,6 +153,14 @@ func (m *ManagedManager) Start(ctx context.Context) ([]Backend, error) {
 		if err := probe(ctx, hostPort(parsed)); err != nil {
 			cleanupErr := terminateManagedContainers(startedContainers)
 			probeErr := fmt.Errorf("probe managed backend %d endpoint %q: %w", i, endpoint, err)
+			if cleanupErr != nil {
+				return nil, errors.Join(probeErr, cleanupErr)
+			}
+			return nil, probeErr
+		}
+		if err := probeAPI(ctx, endpoint); err != nil {
+			cleanupErr := terminateManagedContainers(startedContainers)
+			probeErr := fmt.Errorf("probe managed backend %d API at %q: %w", i, endpoint, err)
 			if cleanupErr != nil {
 				return nil, errors.Join(probeErr, cleanupErr)
 			}
@@ -227,6 +247,71 @@ func (m *ManagedManager) containerRequestForInstance(instanceID int, image strin
 
 func defaultManagedContainerStarter(ctx context.Context, req testcontainers.GenericContainerRequest) (managedContainer, error) {
 	return testcontainers.GenericContainer(ctx, req)
+}
+
+func probeManagedAPI(ctx context.Context, endpoint string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, managedAPIProbeTimeout)
+	defer cancel()
+
+	client := &http.Client{Timeout: managedAPIRequestTimeout}
+	backoff := managedAPIProbeMinBackoff
+	var lastErr error
+
+	for {
+		lastErr = listTablesOnce(probeCtx, client, endpoint)
+		if lastErr == nil {
+			return nil
+		}
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-probeCtx.Done():
+			timer.Stop()
+			return fmt.Errorf("wait for API readiness: %w (last error: %v)", probeCtx.Err(), lastErr)
+		case <-timer.C:
+		}
+
+		if backoff < managedAPIProbeMaxBackoff {
+			backoff *= 2
+			if backoff > managedAPIProbeMaxBackoff {
+				backoff = managedAPIProbeMaxBackoff
+			}
+		}
+	}
+}
+
+func listTablesOnce(ctx context.Context, client *http.Client, endpoint string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(`{"Limit":1}`))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "DynamoDB_20120810.ListTables")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 256))
+		if readErr != nil {
+			return fmt.Errorf("status %s", resp.Status)
+		}
+		bodyText := strings.TrimSpace(string(body))
+		if bodyText == "" {
+			return fmt.Errorf("status %s", resp.Status)
+		}
+		return fmt.Errorf("status %s: %s", resp.Status, bodyText)
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
 }
 
 func terminateManagedContainers(containers []managedContainer) error {

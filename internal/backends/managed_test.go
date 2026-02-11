@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	testcontainers "github.com/testcontainers/testcontainers-go"
 )
@@ -48,6 +52,13 @@ func TestManagedManagerStartAndClose(t *testing.T) {
 		_ = ctx
 		if hostport == "" {
 			return fmt.Errorf("hostport must not be empty")
+		}
+		return nil
+	}
+	manager.probeAPI = func(ctx context.Context, endpoint string) error {
+		_ = ctx
+		if endpoint == "" {
+			return fmt.Errorf("endpoint must not be empty")
 		}
 		return nil
 	}
@@ -124,6 +135,11 @@ func TestManagedManagerStartCleansUpOnStartupError(t *testing.T) {
 		_ = hostport
 		return nil
 	}
+	manager.probeAPI = func(ctx context.Context, endpoint string) error {
+		_ = ctx
+		_ = endpoint
+		return nil
+	}
 
 	var calls int
 	manager.startContainer = func(ctx context.Context, req testcontainers.GenericContainerRequest) (managedContainer, error) {
@@ -148,6 +164,38 @@ func TestManagedManagerStartCleansUpOnStartupError(t *testing.T) {
 	}
 }
 
+func TestManagedManagerStartCleansUpOnAPIProbeError(t *testing.T) {
+	first := &fakeManagedContainer{endpoint: "http://127.0.0.1:20001"}
+
+	manager := NewManagedManager(1, "amazon/dynamodb-local:latest", "")
+	manager.probeHostPort = func(ctx context.Context, hostport string) error {
+		_ = ctx
+		_ = hostport
+		return nil
+	}
+	manager.probeAPI = func(ctx context.Context, endpoint string) error {
+		_ = ctx
+		_ = endpoint
+		return errors.New("backend API not ready")
+	}
+	manager.startContainer = func(ctx context.Context, req testcontainers.GenericContainerRequest) (managedContainer, error) {
+		_ = ctx
+		_ = req
+		return first, nil
+	}
+
+	_, err := manager.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected Start() error")
+	}
+	if !strings.Contains(err.Error(), "probe managed backend 0 API") {
+		t.Fatalf("Start() error = %q, want to contain %q", err.Error(), "probe managed backend 0 API")
+	}
+	if first.terminateCalls != 1 {
+		t.Fatalf("first.terminateCalls = %d, want 1", first.terminateCalls)
+	}
+}
+
 func TestManagedManagerStartValidation(t *testing.T) {
 	manager := NewManagedManager(0, "amazon/dynamodb-local:latest", "")
 	if _, err := manager.Start(context.Background()); err == nil {
@@ -157,5 +205,44 @@ func TestManagedManagerStartValidation(t *testing.T) {
 	manager = NewManagedManager(1, "   ", "")
 	if _, err := manager.Start(context.Background()); err == nil {
 		t.Fatal("expected error for empty image")
+	}
+}
+
+func TestProbeManagedAPIRetriesUntilSuccess(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if got := r.Header.Get("X-Amz-Target"); got != "DynamoDB_20120810.ListTables" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/x-amz-json-1.0" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		current := calls.Add(1)
+		if current < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"starting"}`))
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"TableNames":[]}`))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := probeManagedAPI(ctx, server.URL); err != nil {
+		t.Fatalf("probeManagedAPI() error = %v", err)
+	}
+	if got := calls.Load(); got < 3 {
+		t.Fatalf("calls = %d, want >= 3", got)
 	}
 }
