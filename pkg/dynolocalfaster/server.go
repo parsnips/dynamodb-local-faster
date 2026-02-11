@@ -83,18 +83,28 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		s.state.SetReady(false)
 		s.setStarted(false)
 
+		var cleanupErrs []error
 		if s.metricsServer != nil {
-			_ = s.metricsServer.Shutdown(context.Background())
+			if shutdownErr := s.metricsServer.Shutdown(context.Background()); shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("startup cleanup: shutdown metrics server: %w", shutdownErr))
+			}
 			s.metricsServer = nil
 			s.metricsListen = nil
 		}
 		if s.apiServer != nil {
-			_ = s.apiServer.Shutdown(context.Background())
+			if shutdownErr := s.apiServer.Shutdown(context.Background()); shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("startup cleanup: shutdown api server: %w", shutdownErr))
+			}
 			s.apiServer = nil
 			s.apiListener = nil
 		}
 		if managerStarted {
-			_ = s.manager.Close(context.Background())
+			if closeErr := s.manager.Close(context.Background()); closeErr != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("startup cleanup: close backend manager: %w", closeErr))
+			}
+		}
+		if cleanupErr := errors.Join(cleanupErrs...); cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
 		}
 	}()
 

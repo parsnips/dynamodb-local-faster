@@ -2,6 +2,7 @@ package dynolocalfaster
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -89,6 +90,48 @@ func TestServerStartClosesManagerOnListenFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "listen on") {
 		t.Fatalf("Start() error = %q, want to contain %q", err.Error(), "listen on")
+	}
+	if manager.startCalls != 1 {
+		t.Fatalf("manager.startCalls = %d, want 1", manager.startCalls)
+	}
+	if manager.closeCalls != 1 {
+		t.Fatalf("manager.closeCalls = %d, want 1", manager.closeCalls)
+	}
+	if server.started {
+		t.Fatal("server.started = true, want false")
+	}
+}
+
+func TestServerStartJoinsManagerCloseErrorOnListenFailure(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	defer listener.Close()
+
+	closeErr := errors.New("close failed")
+	manager := &fakeServerManager{
+		startBackends: []backends.Backend{{ID: 0, Endpoint: "http://127.0.0.1:20001"}},
+		closeErr:      closeErr,
+	}
+	server := &Server{
+		cfg: Config{
+			ListenAddr:  listener.Addr().String(),
+			MetricsAddr: "",
+		},
+		manager: manager,
+		state:   metrics.NewState(),
+	}
+
+	err = server.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected Start() error")
+	}
+	if !strings.Contains(err.Error(), "listen on") {
+		t.Fatalf("Start() error = %q, want to contain %q", err.Error(), "listen on")
+	}
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Start() error = %q, want to include manager close error %q", err.Error(), closeErr.Error())
 	}
 	if manager.startCalls != 1 {
 		t.Fatalf("manager.startCalls = %d, want 1", manager.startCalls)
