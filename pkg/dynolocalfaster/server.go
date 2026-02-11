@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/parsnips/dynamodb-local-faster/internal/backends"
 	"github.com/parsnips/dynamodb-local-faster/internal/catalog"
@@ -119,11 +120,14 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		return err
 	}
 
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	streamMux := streams.NewMux(backendsList, streams.MakeProxyFunc(httpClient))
+
 	apiMux := http.NewServeMux()
 	apiMux.Handle("/", httpapi.NewHandler(
 		backendRouter,
 		catalog.NewNoopReplicator(),
-		streams.NewNoopMux(),
+		streamMux,
 		partiql.NewNoopParser(),
 	))
 	apiMux.HandleFunc("/healthz", s.state.HealthHandler)

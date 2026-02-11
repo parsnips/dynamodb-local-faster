@@ -104,36 +104,106 @@ func (s *Server) Close(ctx context.Context) error
 
 ## Routing + API behavior
 
-### Control plane (table/index metadata)
+Every request hits a single HTTP endpoint. The handler inspects the `X-Amz-Target` header to determine the DynamoDB operation, extracts routing keys from the JSON body, and dispatches to one or more of the `N` backends.
 
-- `CreateTable`, `UpdateTable`, `DeleteTable`, and GSI CRUD are broadcast to all backends.
-- Success requires all backends (`N/N`) to avoid schema drift.
-- On partial failure, table is marked `degraded` until reconciliation succeeds.
+Partition-key routing uses `xxhash64(jsonSerializedPK) % N` for deterministic placement.
 
-### Data plane (item operations)
+### Route modes
 
-- Partition-key hash decides backend: `xxhash64(pkBytes) % N`.
-- Single-item ops route to one backend.
-- Batch ops are split per backend and merged into DynamoDB-shaped responses.
-- `Query` with a concrete partition key routes to one backend.
-- `Scan` and unconstrained requests fan out to all backends and merge.
+| Mode | Meaning |
+|------|---------|
+| **single** | Route to exactly one backend based on partition key hash. |
+| **broadcast** | Send to all `N` backends; all must succeed. |
+| **fanout** | Send to all `N` backends in parallel; merge responses. |
 
-### PartiQL
+### Control plane operations
 
-- Parse statement and extract table + partition key when possible.
-- Route to one backend when key can be resolved.
-- Fan out for read-only statements without a concrete key.
-- Reject ambiguous write statements rather than multi-write blindly.
+| Operation | Route | Notes |
+|-----------|-------|-------|
+| `CreateTable` | broadcast | Partition key attribute is remembered for future routing. |
+| `UpdateTable` | broadcast | |
+| `DeleteTable` | broadcast | Partition key attribute is forgotten on success. |
+| `DescribeTable` | single | Sent to one backend (any); schema is identical across all. |
+| `ListTables` | fanout | Results deduplicated. |
+
+### Single-item operations
+
+| Operation | Route | Notes |
+|-----------|-------|-------|
+| `GetItem` | single | Routed by partition key hash. |
+| `PutItem` | single | Routed by partition key hash. |
+| `DeleteItem` | single | Routed by partition key hash. |
+| `UpdateItem` | single | Routed by partition key hash. |
+
+### Batch operations
+
+| Operation | Route | Notes |
+|-----------|-------|-------|
+| `BatchGetItem` | split | Each key is hashed to its backend. Per-backend sub-requests are sent in parallel, responses merged. `UnprocessedKeys` are combined. |
+| `BatchWriteItem` | split | Same split-by-key approach. `UnprocessedItems` are combined. |
+
+### Query and Scan
+
+| Operation | Route | Notes |
+|-----------|-------|-------|
+| `Query` (table, with partition key) | single | Partition key extracted from `KeyConditionExpression`; routed by hash. |
+| `Query` (GSI) | sequential fanout | GSI partition key doesn't match the table partition key, so all backends are queried. |
+| `Query` (no extractable key) | sequential fanout | |
+| `Scan` | sequential fanout | All backends are visited in order. |
+
+### PartiQL (`ExecuteStatement`)
+
+| Statement type | Route | Notes |
+|----------------|-------|-------|
+| `INSERT` with literal/parameter PK | single | Table + partition key extracted from the parsed statement. |
+| `SELECT` with PK in `WHERE` | single | |
+| `SELECT` without PK | sequential fanout | Read-only fan out to all backends. |
+| Write without concrete PK | error | Rejected — would require unsafe multi-backend writes. |
+
+### Sequential fanout pagination
+
+When a `Scan`, `Query`, or `ExecuteStatement` fans out across multiple backends, the handler walks backends sequentially (backend 0, then 1, ..., N-1) and merges `Items` arrays from each response into a single result. This avoids the complexity of parallel pagination while preserving DynamoDB-compatible `Limit` and cursor semantics.
+
+**How it works:**
+
+1. The handler starts at backend 0 (or wherever the incoming cursor points) and proxies the request.
+2. If the backend returns a `LastEvaluatedKey` (or `NextToken` for `ExecuteStatement`), the handler stops — that backend still has more data.
+3. If the backend is exhausted (no cursor) and a `Limit` hasn't been reached, the handler moves to the next backend and continues.
+4. Items from all visited backends are concatenated into a single `Items` array. `Count` and `ScannedCount` are summed.
+
+**Cursor encoding:**
+
+The handler wraps the real backend cursor inside a synthetic `LastEvaluatedKey` that encodes which backend to resume from:
+
+```json
+{
+  "__dlf_fanout_backend": {"N": "2"},
+  "__dlf_fanout_cursor":  {"S": "<base64-encoded real LastEvaluatedKey>"}
+}
+```
+
+The two synthetic attributes use DynamoDB attribute-value format (`{"N": ...}`, `{"S": ...}`) so the cursor is a valid DynamoDB key map. When the client sends this back as `ExclusiveStartKey`, the handler decodes it, routes to backend 2, and passes the real cursor through.
+
+For `ExecuteStatement`, the same scheme uses `NextToken` instead — a `dlfv1:`-prefixed base64 string encoding `{"backend": N, "token": "..."}`.
+
+If the incoming `ExclusiveStartKey` doesn't contain the synthetic attributes, it's treated as a plain cursor for backend 0 — this allows a natural first request with no special encoding.
+
+**Limit handling:**
+
+The client's `Limit` is passed through to each backend request. After each backend responds, the handler subtracts the number of returned items from the remaining limit. When the limit is exhausted, the handler stops and returns a cursor pointing to the next unvisited backend (or the current backend if it still has data).
 
 ### Streams
 
-- Maintain virtual stream identifiers mapped to backend stream ARNs.
-- Expose merged stream APIs:
-  - `ListStreams`
-  - `DescribeStream`
-  - `GetShardIterator`
-  - `GetRecords`
-- Preserve per-shard ordering; no global ordering guarantee across backends.
+Stream operations are handled by a dedicated `StreamMux` that presents one virtual stream per table, regardless of how many backends exist. Backend identity is encoded into shard IDs and iterator tokens using a `dlfb{backendID}:{realToken}` prefix, making routing stateless after initial discovery.
+
+| Operation | Route | Notes |
+|-----------|-------|-------|
+| `ListStreams` | fanout | All backends queried (auto-paginating through each). Results deduplicated by table name; first backend's ARN is canonical. Supports `Limit` and `ExclusiveStartStreamArn` pagination applied after merge. |
+| `DescribeStream` | fanout | All backends for the table are queried (auto-paginating through each). Shards from all backends are merged into one list with virtual shard IDs. Supports `Limit` and `ExclusiveStartShardId` pagination applied after merge. |
+| `GetShardIterator` | single | Virtual shard ID is decoded to extract backend ID + real shard ID. Request is proxied to that single backend. Returned iterator is re-encoded as virtual. |
+| `GetRecords` | single | Virtual iterator is decoded to extract backend ID + real iterator. Request is proxied to that single backend. `NextShardIterator` is re-encoded if present. |
+
+Per-shard ordering is preserved. There is no global ordering guarantee across shards from different backends.
 
 ## Package layout
 

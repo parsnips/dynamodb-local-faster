@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 )
 
 func TestManagedIntegrationAWSv2Modes(t *testing.T) {
@@ -41,7 +42,7 @@ func runManagedIntegrationScenario(t *testing.T, instances int) {
 
 	server, err := New(serverCtx, Config{
 		ListenAddr:  "127.0.0.1:0",
-		MetricsAddr: "",
+		MetricsAddr: "127.0.0.1:0",
 		Mode:        ModeManaged,
 		Instances:   instances,
 		DynamoImage: DefaultDynamoImage,
@@ -261,6 +262,26 @@ func newIntegrationDynamoClient(t *testing.T, endpoint string) *dynamodb.Client 
 	}
 
 	return dynamodb.NewFromConfig(cfg, func(options *dynamodb.Options) {
+		options.BaseEndpoint = aws.String(endpoint)
+	})
+}
+
+func newIntegrationStreamsClient(t *testing.T, endpoint string) *dynamodbstreams.Client {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cfg, err := awscfg.LoadDefaultConfig(
+		ctx,
+		awscfg.WithRegion("us-west-2"),
+		awscfg.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("local", "local", "")),
+	)
+	if err != nil {
+		t.Fatalf("LoadDefaultConfig() error = %v", err)
+	}
+
+	return dynamodbstreams.NewFromConfig(cfg, func(options *dynamodbstreams.Options) {
 		options.BaseEndpoint = aws.String(endpoint)
 	})
 }

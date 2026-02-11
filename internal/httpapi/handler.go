@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/parsnips/dynamodb-local-faster/internal/backends"
 	"github.com/parsnips/dynamodb-local-faster/internal/catalog"
@@ -124,6 +126,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeProxiedResponse(w, response)
+		return
+	case "ListStreams", "DescribeStream", "GetShardIterator", "GetRecords":
+		statusCode, respBody, err := h.handleStreamOp(r.Context(), op, body)
+		if err != nil {
+			var streamErr *streams.StreamError
+			if errors.As(err, &streamErr) {
+				writeDynamoError(w, streamErr.StatusCode, streamErr.ErrorType, streamErr.Message)
+			} else {
+				writeDynamoError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		w.Header().Set("X-Amz-Crc32", strconv.FormatUint(uint64(crc32.ChecksumIEEE(respBody)), 10))
+		w.WriteHeader(statusCode)
+		w.Write(respBody)
 		return
 	}
 
@@ -324,6 +342,21 @@ func (h *Handler) applyControlPlaneSideEffects(
 		h.forgetTable(tableName)
 	}
 	return nil
+}
+
+func (h *Handler) handleStreamOp(ctx context.Context, op string, body []byte) (int, []byte, error) {
+	switch op {
+	case "ListStreams":
+		return h.streams.ListStreams(ctx, body)
+	case "DescribeStream":
+		return h.streams.DescribeStream(ctx, body)
+	case "GetShardIterator":
+		return h.streams.GetShardIterator(ctx, body)
+	case "GetRecords":
+		return h.streams.GetRecords(ctx, body)
+	default:
+		return http.StatusBadRequest, nil, fmt.Errorf("unsupported stream operation: %s", op)
+	}
 }
 
 func (h *Handler) rememberTablePartitionKey(payload map[string]json.RawMessage) {
@@ -993,17 +1026,8 @@ func mergeFanoutResponses(op string, responses []proxiedResponse) (proxiedRespon
 	}
 
 	switch op {
-	case "DescribeStream", "GetShardIterator", "GetRecords":
-		for _, response := range responses {
-			if isHTTPSuccess(response.statusCode) {
-				return response, nil
-			}
-		}
-		return responses[0], nil
 	case "ListTables":
 		return mergeListTablesResponses(responses)
-	case "ListStreams":
-		return mergeListStreamsResponses(responses)
 	case "Scan", "Query", "ExecuteStatement":
 		if failed := firstFailureResponse(responses); failed != nil {
 			return *failed, nil
@@ -1047,35 +1071,6 @@ func mergeListTablesResponses(responses []proxiedResponse) (proxiedResponse, err
 	sort.Strings(names)
 	body, err := json.Marshal(map[string]any{
 		"TableNames": names,
-	})
-	if err != nil {
-		return proxiedResponse{}, err
-	}
-
-	return proxiedResponse{
-		statusCode: http.StatusOK,
-		header:     defaultDynamoHeader(body),
-		body:       body,
-	}, nil
-}
-
-func mergeListStreamsResponses(responses []proxiedResponse) (proxiedResponse, error) {
-	if failed := firstFailureResponse(responses); failed != nil {
-		return *failed, nil
-	}
-
-	streamsList := make([]any, 0)
-	for _, response := range responses {
-		payload, err := decodeJSONMap(response.body)
-		if err != nil {
-			return proxiedResponse{}, err
-		}
-		rawStreams, _ := payload["Streams"].([]any)
-		streamsList = append(streamsList, rawStreams...)
-	}
-
-	body, err := json.Marshal(map[string]any{
-		"Streams": streamsList,
 	})
 	if err != nil {
 		return proxiedResponse{}, err

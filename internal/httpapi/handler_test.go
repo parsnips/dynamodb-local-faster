@@ -336,3 +336,43 @@ func TestHandlerRoutesExecuteStatementWithParametersToSingleBackend(t *testing.T
 		}
 	}
 }
+
+func TestHandlerReturnsValidationForInvalidListStreamsPayload(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("backend should not be called for invalid ListStreams payload")
+	}))
+	defer backend.Close()
+
+	backendsList := []backends.Backend{
+		{ID: 0, Endpoint: backend.URL},
+	}
+	r, err := router.NewStaticRouter(backendsList)
+	if err != nil {
+		t.Fatalf("NewStaticRouter() error = %v", err)
+	}
+
+	handler := NewHandler(
+		r,
+		catalog.NewNoopReplicator(),
+		streams.NewMux(backendsList, streams.MakeProxyFunc(http.DefaultClient)),
+		partiql.NewNoopParser(),
+	)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/",
+		strings.NewReader(`{"Limit":"bad"}`),
+	)
+	req.Header.Set("X-Amz-Target", "DynamoDB_20120810.ListStreams")
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if status := recorder.Code; status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+	}
+	if got := recorder.Body.String(); !strings.Contains(got, `"__type":"ValidationException"`) {
+		t.Fatalf("response body = %q, want ValidationException", got)
+	}
+}

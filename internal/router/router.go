@@ -157,13 +157,7 @@ func PlanOperation(r BackendRouter, request OperationRequest) (OperationRoute, e
 			return OperationRoute{}, err
 		}
 		return OperationRoute{Mode: RouteModeBroadcast, Backends: targets}, nil
-	case "ListTables", "ListStreams":
-		targets, err := r.ResolveTable(op)
-		if err != nil {
-			return OperationRoute{}, err
-		}
-		return OperationRoute{Mode: RouteModeFanout, Backends: targets}, nil
-	case "DescribeStream", "GetShardIterator", "GetRecords":
+	case "ListTables":
 		targets, err := r.ResolveTable(op)
 		if err != nil {
 			return OperationRoute{}, err

@@ -7,12 +7,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
+	dynamodbstreamstypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -156,6 +159,231 @@ func TestManagedRegressionExecuteStatementInsertWithParametersWorks(t *testing.T
 	}
 }
 
+func TestManagedRegressionGSIQueryReturnsItemsFromAllBackends(t *testing.T) {
+	ctx, client := startManagedRegressionHarness(t, 2)
+
+	tableName := fmt.Sprintf("it-reg-gsi-xbackend-%d", time.Now().UnixNano())
+	gsiName := "gsi-by-group"
+
+	// Create table with pk as partition key, plus gsi_pk attribute for the GSI.
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(tableName),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("gsi_pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+		},
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+			{
+				IndexName: aws.String(gsiName),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("gsi_pk"), KeyType: types.KeyTypeHash},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("CreateTable error = %v", err)
+	}
+
+	waiter := dynamodb.NewTableExistsWaiter(client)
+	if err := waiter.Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(tableName)}, 2*time.Minute); err != nil {
+		t.Fatalf("wait for table error = %v", err)
+	}
+	if err := waitForTableReadyOnAllBackends(ctx, client, tableName); err != nil {
+		t.Fatalf("waitForTableReadyOnAllBackends error = %v", err)
+	}
+	if err := waitForGSIReadyOnAllBackends(ctx, client, tableName, gsiName); err != nil {
+		t.Fatalf("waitForGSIReadyOnAllBackends error = %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cleanupCancel()
+		client.DeleteTable(cleanupCtx, &dynamodb.DeleteTableInput{TableName: aws.String(tableName)})
+	})
+
+	// Find two table PKs that hash to different backends (backend 0 and backend 1).
+	keys := findStringPartitionKeysByBucket(t, 2)
+	keyOnBackend0 := keys[0]
+	keyOnBackend1 := keys[1]
+
+	// Write both items with the SAME gsi_pk so they'd appear together in a GSI query,
+	// but they live on different backends due to different table partition keys.
+	sharedGSIKey := "same-group"
+
+	for _, pk := range []string{keyOnBackend0, keyOnBackend1} {
+		_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(tableName),
+			Item: map[string]types.AttributeValue{
+				"pk":      &types.AttributeValueMemberS{Value: pk},
+				"gsi_pk":  &types.AttributeValueMemberS{Value: sharedGSIKey},
+				"payload": &types.AttributeValueMemberS{Value: "payload-" + pk},
+			},
+		})
+		if err != nil {
+			t.Fatalf("PutItem(%q) error = %v", pk, err)
+		}
+	}
+
+	// Query the GSI — this must fan out to BOTH backends to find both items.
+	queryOutput, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(tableName),
+		IndexName:              aws.String(gsiName),
+		KeyConditionExpression: aws.String("gsi_pk = :gsi"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":gsi": &types.AttributeValueMemberS{Value: sharedGSIKey},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Query(GSI gsi_pk=%q) error = %v", sharedGSIKey, err)
+	}
+
+	gotPKs := collectPKs(queryOutput.Items)
+	wantPKs := []string{keyOnBackend0, keyOnBackend1}
+	sort.Strings(wantPKs)
+
+	if len(gotPKs) != 2 {
+		t.Fatalf("Query(GSI) returned %d items (pks=%v), want 2 items (pks=%v)", len(gotPKs), gotPKs, wantPKs)
+	}
+	if gotPKs[0] != wantPKs[0] || gotPKs[1] != wantPKs[1] {
+		t.Fatalf("Query(GSI) returned pks=%v, want %v", gotPKs, wantPKs)
+	}
+}
+
+func TestManagedRegressionStreamsOperationsWork(t *testing.T) {
+	ctx, client := startManagedRegressionHarness(t, 2)
+	endpoint := aws.ToString(client.Options().BaseEndpoint)
+	if endpoint == "" {
+		t.Fatal("dynamodb client endpoint is empty")
+	}
+	streamClient := newIntegrationStreamsClient(t, endpoint)
+	tableName := createRegressionStreamTable(t, ctx, client, "it-reg-streams")
+
+	keys := findStringPartitionKeysByBucket(t, 2)
+	keyOnBackend0 := keys[0]
+	keyOnBackend1 := keys[1]
+
+	for _, pk := range []string{keyOnBackend0, keyOnBackend1} {
+		_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(tableName),
+			Item: map[string]types.AttributeValue{
+				"pk":      &types.AttributeValueMemberS{Value: pk},
+				"payload": &types.AttributeValueMemberS{Value: "payload-" + pk},
+			},
+		})
+		if err != nil {
+			t.Fatalf("PutItem(%q) error = %v", pk, err)
+		}
+	}
+
+	var (
+		observedStreamARN string
+		observedShards    int
+		observedRecords   int
+	)
+	if err := waitForSuccess(ctx, 300*time.Millisecond, func(runCtx context.Context) error {
+		listOutput, err := streamClient.ListStreams(runCtx, &dynamodbstreams.ListStreamsInput{
+			TableName: aws.String(tableName),
+		})
+		if err != nil {
+			return fmt.Errorf("ListStreams(%q): %w", tableName, err)
+		}
+		if len(listOutput.Streams) == 0 {
+			return fmt.Errorf("ListStreams(%q) returned no streams", tableName)
+		}
+
+		streamARN := ""
+		for _, stream := range listOutput.Streams {
+			if aws.ToString(stream.TableName) == tableName {
+				streamARN = aws.ToString(stream.StreamArn)
+				break
+			}
+		}
+		if streamARN == "" {
+			return fmt.Errorf("ListStreams(%q) returned no stream ARN for table", tableName)
+		}
+
+		describeOutput, err := streamClient.DescribeStream(runCtx, &dynamodbstreams.DescribeStreamInput{
+			StreamArn: aws.String(streamARN),
+		})
+		if err != nil {
+			return fmt.Errorf("DescribeStream(%q): %w", streamARN, err)
+		}
+		if describeOutput.StreamDescription == nil {
+			return fmt.Errorf("DescribeStream(%q) returned nil StreamDescription", streamARN)
+		}
+		if len(describeOutput.StreamDescription.Shards) == 0 {
+			return fmt.Errorf("DescribeStream(%q) returned no shards", streamARN)
+		}
+
+		recordsFound := 0
+		for _, shard := range describeOutput.StreamDescription.Shards {
+			shardID := aws.ToString(shard.ShardId)
+			if shardID == "" {
+				return fmt.Errorf("DescribeStream(%q) returned shard with empty ShardId", streamARN)
+			}
+			if !strings.HasPrefix(shardID, "dlfb") {
+				return fmt.Errorf("DescribeStream(%q) returned non-virtual shard ID %q", streamARN, shardID)
+			}
+
+			iteratorOutput, err := streamClient.GetShardIterator(runCtx, &dynamodbstreams.GetShardIteratorInput{
+				StreamArn:         aws.String(streamARN),
+				ShardId:           aws.String(shardID),
+				ShardIteratorType: dynamodbstreamstypes.ShardIteratorTypeTrimHorizon,
+			})
+			if err != nil {
+				return fmt.Errorf("GetShardIterator(%q, %q): %w", streamARN, shardID, err)
+			}
+
+			shardIterator := aws.ToString(iteratorOutput.ShardIterator)
+			if shardIterator == "" {
+				return fmt.Errorf("GetShardIterator(%q, %q) returned empty iterator", streamARN, shardID)
+			}
+			if !strings.HasPrefix(shardIterator, "dlfb") {
+				return fmt.Errorf("GetShardIterator(%q, %q) returned non-virtual iterator %q", streamARN, shardID, shardIterator)
+			}
+
+			recordsOutput, err := streamClient.GetRecords(runCtx, &dynamodbstreams.GetRecordsInput{
+				ShardIterator: iteratorOutput.ShardIterator,
+				Limit:         aws.Int32(100),
+			})
+			if err != nil {
+				return fmt.Errorf("GetRecords(%q): %w", shardIterator, err)
+			}
+			recordsFound += len(recordsOutput.Records)
+
+			nextIterator := aws.ToString(recordsOutput.NextShardIterator)
+			if nextIterator != "" && !strings.HasPrefix(nextIterator, "dlfb") {
+				return fmt.Errorf("GetRecords(%q) returned non-virtual next iterator %q", shardIterator, nextIterator)
+			}
+		}
+		if recordsFound == 0 {
+			return fmt.Errorf("GetRecords found no records yet for %q", streamARN)
+		}
+
+		observedStreamARN = streamARN
+		observedShards = len(describeOutput.StreamDescription.Shards)
+		observedRecords = recordsFound
+		return nil
+	}); err != nil {
+		t.Fatalf("stream operations did not stabilize: %v", err)
+	}
+
+	if observedStreamARN == "" {
+		t.Fatal("observedStreamARN is empty after successful stream operations")
+	}
+	if observedShards == 0 {
+		t.Fatal("observedShards is zero after successful stream operations")
+	}
+	if observedRecords == 0 {
+		t.Fatal("observedRecords is zero after successful stream operations")
+	}
+}
+
 func startManagedRegressionHarness(t *testing.T, instances int) (context.Context, *dynamodb.Client) {
 	t.Helper()
 
@@ -164,7 +392,7 @@ func startManagedRegressionHarness(t *testing.T, instances int) (context.Context
 
 	server, err := New(serverCtx, Config{
 		ListenAddr:  "127.0.0.1:0",
-		MetricsAddr: "",
+		MetricsAddr: "127.0.0.1:0",
 		Mode:        ModeManaged,
 		Instances:   instances,
 		DynamoImage: DefaultDynamoImage,
@@ -195,6 +423,66 @@ func createRegressionTable(t *testing.T, ctx context.Context, client *dynamodb.C
 	tableName := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 	if err := createTestTable(ctx, client, tableName); err != nil {
 		t.Fatalf("createTestTable(%q) error = %v", tableName, err)
+	}
+	if err := waitForTableReadyOnAllBackends(ctx, client, tableName); err != nil {
+		t.Fatalf("waitForTableReadyOnAllBackends(%q) error = %v", tableName, err)
+	}
+
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cleanupCancel()
+
+		_, deleteErr := client.DeleteTable(cleanupCtx, &dynamodb.DeleteTableInput{
+			TableName: aws.String(tableName),
+		})
+		if deleteErr != nil {
+			t.Logf("DeleteTable(%q) cleanup error = %v", tableName, deleteErr)
+			return
+		}
+		waiter := dynamodb.NewTableNotExistsWaiter(client)
+		if waitErr := waiter.Wait(
+			cleanupCtx,
+			&dynamodb.DescribeTableInput{TableName: aws.String(tableName)},
+			time.Minute,
+		); waitErr != nil {
+			t.Logf("wait for DeleteTable(%q) cleanup error = %v", tableName, waitErr)
+		}
+	})
+
+	return tableName
+}
+
+func createRegressionStreamTable(t *testing.T, ctx context.Context, client *dynamodb.Client, prefix string) string {
+	t.Helper()
+
+	tableName := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(tableName),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{
+				AttributeName: aws.String("pk"),
+				AttributeType: types.ScalarAttributeTypeS,
+			},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{
+				AttributeName: aws.String("pk"),
+				KeyType:       types.KeyTypeHash,
+			},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+		StreamSpecification: &types.StreamSpecification{
+			StreamEnabled:  aws.Bool(true),
+			StreamViewType: types.StreamViewTypeNewImage,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTable(%q) with stream error = %v", tableName, err)
+	}
+
+	waiter := dynamodb.NewTableExistsWaiter(client)
+	if err := waiter.Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(tableName)}, 2*time.Minute); err != nil {
+		t.Fatalf("wait for CreateTable(%q) error = %v", tableName, err)
 	}
 	if err := waitForTableReadyOnAllBackends(ctx, client, tableName); err != nil {
 		t.Fatalf("waitForTableReadyOnAllBackends(%q) error = %v", tableName, err)
