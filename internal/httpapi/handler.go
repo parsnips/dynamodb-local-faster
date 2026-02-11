@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -458,7 +460,7 @@ func mergeListTablesResponses(responses []proxiedResponse) (proxiedResponse, err
 
 	return proxiedResponse{
 		statusCode: http.StatusOK,
-		header:     defaultDynamoHeader(),
+		header:     defaultDynamoHeader(body),
 		body:       body,
 	}, nil
 }
@@ -487,7 +489,7 @@ func mergeListStreamsResponses(responses []proxiedResponse) (proxiedResponse, er
 
 	return proxiedResponse{
 		statusCode: http.StatusOK,
-		header:     defaultDynamoHeader(),
+		header:     defaultDynamoHeader(body),
 		body:       body,
 	}, nil
 }
@@ -550,7 +552,7 @@ func mergeItemsResponse(responses []proxiedResponse) (proxiedResponse, error) {
 
 	return proxiedResponse{
 		statusCode: http.StatusOK,
-		header:     defaultDynamoHeader(),
+		header:     defaultDynamoHeader(body),
 		body:       body,
 	}, nil
 }
@@ -664,9 +666,10 @@ func copyHeader(dst http.Header, src http.Header) {
 	}
 }
 
-func defaultDynamoHeader() http.Header {
+func defaultDynamoHeader(body []byte) http.Header {
 	return http.Header{
 		"Content-Type": []string{"application/x-amz-json-1.0"},
+		"X-Amz-Crc32":  []string{strconv.FormatUint(uint64(crc32.ChecksumIEEE(body)), 10)},
 	}
 }
 

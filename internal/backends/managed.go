@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,6 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awscfg "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	testcontainers "github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -25,7 +27,6 @@ const (
 	managedAPIProbeTimeout     = 20 * time.Second
 	managedAPIProbeMinBackoff  = 100 * time.Millisecond
 	managedAPIProbeMaxBackoff  = 1 * time.Second
-	managedAPIRequestTimeout   = 2 * time.Second
 )
 
 type managedContainer interface {
@@ -257,12 +258,16 @@ func probeManagedAPI(ctx context.Context, endpoint string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, managedAPIProbeTimeout)
 	defer cancel()
 
-	client := &http.Client{Timeout: managedAPIRequestTimeout}
+	client, err := managedProbeClient(probeCtx, endpoint)
+	if err != nil {
+		return fmt.Errorf("build managed API probe client: %w", err)
+	}
+
 	backoff := managedAPIProbeMinBackoff
 	var lastErr error
 
 	for {
-		lastErr = listTablesOnce(probeCtx, client, endpoint)
+		lastErr = listTablesOnce(probeCtx, client)
 		if lastErr == nil {
 			return nil
 		}
@@ -284,34 +289,26 @@ func probeManagedAPI(ctx context.Context, endpoint string) error {
 	}
 }
 
-func listTablesOnce(ctx context.Context, client *http.Client, endpoint string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(`{"Limit":1}`))
+func managedProbeClient(ctx context.Context, endpoint string) (*dynamodb.Client, error) {
+	cfg, err := awscfg.LoadDefaultConfig(
+		ctx,
+		awscfg.WithRegion("us-west-2"),
+		awscfg.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("local", "local", "")),
+	)
 	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
-	req.Header.Set("X-Amz-Target", "DynamoDB_20120810.ListTables")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 256))
-		if readErr != nil {
-			return fmt.Errorf("status %s", resp.Status)
-		}
-		bodyText := strings.TrimSpace(string(body))
-		if bodyText == "" {
-			return fmt.Errorf("status %s", resp.Status)
-		}
-		return fmt.Errorf("status %s: %s", resp.Status, bodyText)
+		return nil, err
 	}
 
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return nil
+	return dynamodb.NewFromConfig(cfg, func(options *dynamodb.Options) {
+		options.BaseEndpoint = aws.String(endpoint)
+	}), nil
+}
+
+func listTablesOnce(ctx context.Context, client *dynamodb.Client) error {
+	_, err := client.ListTables(ctx, &dynamodb.ListTablesInput{
+		Limit: aws.Int32(1),
+	})
+	return err
 }
 
 func terminateManagedContainers(containers []managedContainer) error {

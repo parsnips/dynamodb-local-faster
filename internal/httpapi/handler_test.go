@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -174,5 +176,9 @@ func TestHandlerMergesListTablesFanout(t *testing.T) {
 	}
 	if got, want := strings.TrimSpace(recorder.Body.String()), `{"TableNames":["inventory","orders","users"]}`; got != want {
 		t.Fatalf("response body = %q, want %q", got, want)
+	}
+	wantCRC := strconv.FormatUint(uint64(crc32.ChecksumIEEE(recorder.Body.Bytes())), 10)
+	if got := recorder.Header().Get("X-Amz-Crc32"); got != wantCRC {
+		t.Fatalf("X-Amz-Crc32 = %q, want %q", got, wantCRC)
 	}
 }

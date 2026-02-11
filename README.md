@@ -2,6 +2,40 @@
 
 A DynamoDB-compatible routing layer that shards requests across multiple DynamoDB Local backends to overcome the single-threaded bottleneck.
 
+## Build
+
+### Prerequisites
+
+- Go `1.25.1` (or newer `1.25.x`)
+- Docker (required for `managed` mode and integration tests)
+
+### Build the CLI
+
+```bash
+go build ./cmd/dynamodb-local-faster
+```
+
+### Build a named binary
+
+```bash
+mkdir -p bin
+go build -o bin/dynamodb-local-faster ./cmd/dynamodb-local-faster
+```
+
+## Testing
+
+### Run default test suite
+
+```bash
+go test ./...
+```
+
+### Run integration tests (managed mode)
+
+```bash
+go test -tags=integration ./pkg/dynolocalfaster -run TestManagedIntegrationAWSv2Modes -count=1
+```
+
 ## Plan
 
 ### Goals
