@@ -99,10 +99,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	bodyBuf, err := readBody(r.Body)
 	if err != nil {
 		writeDynamoError(w, http.StatusBadRequest, "ValidationException", "unable to read request body")
 		return
+	}
+	defer putPoolBuffer(&bodyPool, bodyBuf)
+	body := bodyBuf.Bytes()
+
+	// Fast path: route single-item ops via gjson field extraction
+	// instead of full JSON unmarshal. Falls through on failure.
+	if _, ok := fastPathContainerField[op]; ok {
+		if h.tryFastPathSingleItem(w, r, op, body) {
+			return
+		}
 	}
 
 	payload, err := decodePayloadObject(body)
