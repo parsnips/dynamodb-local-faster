@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -53,11 +54,12 @@ const (
 )
 
 type Handler struct {
-	router  router.BackendRouter
-	catalog catalog.CatalogReplicator
-	streams streams.StreamMux
-	parser  partiql.Parser
-	client  *http.Client
+	router         router.BackendRouter
+	catalog        catalog.CatalogReplicator
+	streams        streams.StreamMux
+	parser         partiql.Parser
+	client         *http.Client
+	reverseProxies sync.Map // map[int]*httputil.ReverseProxy, lazily cached per backend
 }
 
 type proxiedResponse struct {
