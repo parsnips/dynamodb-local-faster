@@ -17,6 +17,9 @@ func TestNormalizeConfigDefaults(t *testing.T) {
 	if cfg.Instances != DefaultInstances {
 		t.Fatalf("Instances = %d, want %d", cfg.Instances, DefaultInstances)
 	}
+	if cfg.BackendRuntime != DefaultManagedRuntime {
+		t.Fatalf("BackendRuntime = %q, want %q", cfg.BackendRuntime, DefaultManagedRuntime)
+	}
 }
 
 func TestNormalizeConfigAttachedRequiresEndpoints(t *testing.T) {
@@ -42,5 +45,15 @@ func TestNormalizeConfigAddsBackendScheme(t *testing.T) {
 	}
 	if cfg.BackendEndpoints[1] != "http://127.0.0.1:8002" {
 		t.Fatalf("endpoint[1] = %q", cfg.BackendEndpoints[1])
+	}
+}
+
+func TestNormalizeConfigRejectsUnknownManagedBackendRuntime(t *testing.T) {
+	_, err := normalizeConfig(Config{
+		Mode:           ModeManaged,
+		BackendRuntime: ManagedBackendRuntime("wat"),
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown managed backend runtime")
 	}
 }

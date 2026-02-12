@@ -81,6 +81,18 @@ Example:
 DLF_BENCH_WORKERS=10 DLF_BENCH_LATENCY_SAMPLE_RATE=10 go test -tags=integration -run='^$' -bench=BenchmarkWriteThroughput -benchtime=15s -count=1 -v ./pkg/dynolocalfaster
 ```
 
+`DLF_BENCH_CLIENT_MODE`
+
+- Request client implementation for benchmark hot-path writes.
+- `aws-sdk` (default): full AWS SDK request path.
+- `raw-http`: raw JSON-over-HTTP with SigV4 signing, bypassing SDK middleware/serialization in the hot path.
+
+Example:
+
+```bash
+DLF_BENCH_WORKERS=40 DLF_BENCH_CLIENT_MODE=raw-http go test -tags=integration -run='^$' -bench=BenchmarkWriteThroughput -benchtime=15s -count=1 -v ./pkg/dynolocalfaster
+```
+
 ### Reported metrics
 
 Each benchmark line includes:
@@ -133,8 +145,15 @@ package dynolocalfaster
 type Mode string
 
 const (
-    ModeManaged  Mode = "managed"  // start local backends with testcontainers
+    ModeManaged  Mode = "managed"  // start local backends via managed runtime
     ModeAttached Mode = "attached" // connect to already-running backends
+)
+
+type ManagedBackendRuntime string
+
+const (
+    ManagedBackendRuntimeHost      ManagedBackendRuntime = "host"
+    ManagedBackendRuntimeContainer ManagedBackendRuntime = "container"
 )
 
 type Config struct {
@@ -143,7 +162,9 @@ type Config struct {
     Mode            Mode
     BackendEndpoints []string // required for ModeAttached
     DynamoImage     string
-    StateDir        string
+    BackendRuntime  ManagedBackendRuntime // host|container (default host)
+    DynamoLocalPath string               // host runtime path to DynamoDBLocal.jar + DynamoDBLocal_lib
+    StateDir        string // optional; enables persistent backend volumes when set
     MetricsAddr     string
 }
 
@@ -162,7 +183,12 @@ func (s *Server) Close(ctx context.Context) error
 - `ModeAttached` is the immediate startup path:
   - no container lifecycle management
   - server becomes ready as soon as endpoint probes pass
-- `ModeManaged` starts `N` containers via `testcontainers-go`.
+- `ModeManaged` starts `N` backends in one of two runtimes:
+  - `host` (default): starts local `java -jar DynamoDBLocal.jar` processes.
+  - `container`: starts Docker containers via `testcontainers-go`.
+  - if runtime is `host` and Java/JAR prerequisites are missing, startup falls back to `container`.
+  - host runtime artifact lookup order: `Config.DynamoLocalPath`, `DLF_DYNAMODB_LOCAL_PATH`, working directory, common install dirs.
+  - default backend data mode is in-memory (`-inMemory`); persistence is enabled only when `StateDir` (or `--state-dir`) is set.
 
 ## Routing + API behavior
 
@@ -336,7 +362,9 @@ internal/metrics/                # Prometheus metrics + health endpoints
 - `--mode` (`managed|attached`)
 - `--backend-endpoints` (comma-separated, required in `attached`)
 - `--image`
-- `--state-dir`
+- `--backend-runtime` (`host|container`, default `host`)
+- `--dynamodb-local-path` (path containing `DynamoDBLocal.jar` and `DynamoDBLocal_lib`; used by host runtime)
+- `--state-dir` (optional; enables persistent backend volumes)
 - `--metrics-addr`
 
 ## Assumptions and defaults

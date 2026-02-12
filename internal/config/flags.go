@@ -13,13 +13,26 @@ func ParseFlags(args []string) (dynolocalfaster.Config, error) {
 	var cfg dynolocalfaster.Config
 	var mode string
 	var backendEndpoints string
+	var backendRuntime string
 
 	fs.StringVar(&cfg.ListenAddr, "listen-addr", dynolocalfaster.DefaultListenAddr, "address for the DynamoDB-compatible API")
 	fs.IntVar(&cfg.Instances, "instances", dynolocalfaster.DefaultInstances, "number of DynamoDB Local instances in managed mode")
 	fs.StringVar(&mode, "mode", string(dynolocalfaster.DefaultMode), "startup mode: managed|attached")
 	fs.StringVar(&backendEndpoints, "backend-endpoints", "", "comma-separated backend endpoints (required for attached mode)")
 	fs.StringVar(&cfg.DynamoImage, "image", dynolocalfaster.DefaultDynamoImage, "DynamoDB Local image for managed mode")
-	fs.StringVar(&cfg.StateDir, "state-dir", "", "state directory for managed mode")
+	fs.StringVar(
+		&backendRuntime,
+		"backend-runtime",
+		string(dynolocalfaster.DefaultManagedRuntime),
+		"managed backend runtime: host|container",
+	)
+	fs.StringVar(
+		&cfg.DynamoLocalPath,
+		"dynamodb-local-path",
+		"",
+		"path to DynamoDB Local distribution dir (contains DynamoDBLocal.jar and DynamoDBLocal_lib) for host runtime",
+	)
+	fs.StringVar(&cfg.StateDir, "state-dir", "", "state directory for managed mode (enables persistent backend volumes; default is in-memory)")
 	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", dynolocalfaster.DefaultMetricsAddr, "metrics and health endpoint address")
 
 	if err := fs.Parse(args); err != nil {
@@ -28,6 +41,7 @@ func ParseFlags(args []string) (dynolocalfaster.Config, error) {
 
 	cfg.Mode = dynolocalfaster.Mode(mode)
 	cfg.BackendEndpoints = splitCSV(backendEndpoints)
+	cfg.BackendRuntime = dynolocalfaster.ManagedBackendRuntime(backendRuntime)
 
 	return cfg, nil
 }

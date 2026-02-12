@@ -29,24 +29,29 @@ func TestManagedIntegrationAWSv2Modes(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			runManagedIntegrationScenario(t, tc.instances)
+			runManagedIntegrationScenario(t, tc.instances, DefaultManagedRuntime)
 		})
 	}
 }
 
-func runManagedIntegrationScenario(t *testing.T, instances int) {
+func TestManagedIntegrationAWSv2ContainerRuntimeSingleInstance(t *testing.T) {
+	runManagedIntegrationScenario(t, 1, ManagedBackendRuntimeContainer)
+}
+
+func runManagedIntegrationScenario(t *testing.T, instances int, runtime ManagedBackendRuntime) {
 	t.Helper()
 
 	serverCtx, serverCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer serverCancel()
 
 	server, err := New(serverCtx, Config{
-		ListenAddr:  "127.0.0.1:0",
-		MetricsAddr: "127.0.0.1:0",
-		Mode:        ModeManaged,
-		Instances:   instances,
-		DynamoImage: DefaultDynamoImage,
-		StateDir:    t.TempDir(),
+		ListenAddr:     "127.0.0.1:0",
+		MetricsAddr:    "127.0.0.1:0",
+		Mode:           ModeManaged,
+		Instances:      instances,
+		DynamoImage:    DefaultDynamoImage,
+		BackendRuntime: runtime,
+		StateDir:       t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)

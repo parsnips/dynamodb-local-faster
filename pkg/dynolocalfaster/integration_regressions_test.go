@@ -4,9 +4,9 @@ package dynolocalfaster
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -545,8 +545,11 @@ func findStringPartitionKeysByBucket(t *testing.T, instances int) map[uint64]str
 }
 
 func routeBucketForStringPK(pk string, instances uint64) uint64 {
-	raw, _ := json.Marshal(map[string]string{"S": pk})
-	return xxhash.Sum64(raw) % instances
+	// Router hashing operates on canonical JSON for the partition key attribute
+	// value. Build the same canonical string directly to avoid json.Marshal/map
+	// overhead in hot benchmark paths.
+	canonical := `{"S":` + strconv.Quote(pk) + `}`
+	return xxhash.Sum64String(canonical) % instances
 }
 
 func collectPKs(items []map[string]types.AttributeValue) []string {

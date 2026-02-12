@@ -49,10 +49,12 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	case ModeAttached:
 		manager = backends.NewAttachedManager(normalized.BackendEndpoints)
 	case ModeManaged:
-		manager = backends.NewManagedManager(
+		manager = backends.NewManagedManagerWithRuntime(
 			normalized.Instances,
 			normalized.DynamoImage,
 			normalized.StateDir,
+			string(normalized.BackendRuntime),
+			normalized.DynamoLocalPath,
 		)
 	default:
 		return nil, fmt.Errorf("unsupported mode %q", normalized.Mode)

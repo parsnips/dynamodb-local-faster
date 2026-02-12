@@ -13,12 +13,20 @@ const (
 	ModeAttached Mode = "attached"
 )
 
+type ManagedBackendRuntime string
+
 const (
-	DefaultListenAddr  = "127.0.0.1:8000"
-	DefaultInstances   = 4
-	DefaultMode        = ModeManaged
-	DefaultDynamoImage = "amazon/dynamodb-local:latest"
-	DefaultMetricsAddr = "127.0.0.1:9090"
+	ManagedBackendRuntimeHost      ManagedBackendRuntime = "host"
+	ManagedBackendRuntimeContainer ManagedBackendRuntime = "container"
+)
+
+const (
+	DefaultListenAddr     = "127.0.0.1:8000"
+	DefaultInstances      = 4
+	DefaultMode           = ModeManaged
+	DefaultDynamoImage    = "amazon/dynamodb-local:latest"
+	DefaultMetricsAddr    = "127.0.0.1:9090"
+	DefaultManagedRuntime = ManagedBackendRuntimeHost
 )
 
 type Config struct {
@@ -27,6 +35,8 @@ type Config struct {
 	Mode             Mode
 	BackendEndpoints []string
 	DynamoImage      string
+	BackendRuntime   ManagedBackendRuntime
+	DynamoLocalPath  string
 	StateDir         string
 	MetricsAddr      string
 }
@@ -47,6 +57,11 @@ func normalizeConfig(cfg Config) (Config, error) {
 	if strings.TrimSpace(cfg.MetricsAddr) == "" {
 		cfg.MetricsAddr = DefaultMetricsAddr
 	}
+	cfg.BackendRuntime = ManagedBackendRuntime(strings.ToLower(strings.TrimSpace(string(cfg.BackendRuntime))))
+	if cfg.BackendRuntime == "" {
+		cfg.BackendRuntime = DefaultManagedRuntime
+	}
+	cfg.DynamoLocalPath = strings.TrimSpace(cfg.DynamoLocalPath)
 
 	cfg.BackendEndpoints = normalizeEndpointList(cfg.BackendEndpoints)
 
@@ -76,6 +91,15 @@ func validateConfig(cfg Config) error {
 	case ModeManaged:
 		if cfg.Instances <= 0 {
 			return fmt.Errorf("instances must be > 0 in managed mode")
+		}
+		switch cfg.BackendRuntime {
+		case ManagedBackendRuntimeHost, ManagedBackendRuntimeContainer:
+		default:
+			return fmt.Errorf(
+				"backend_runtime must be %q or %q in managed mode",
+				ManagedBackendRuntimeHost,
+				ManagedBackendRuntimeContainer,
+			)
 		}
 	case ModeAttached:
 		if len(cfg.BackendEndpoints) == 0 {

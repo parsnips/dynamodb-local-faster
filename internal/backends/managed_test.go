@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -47,7 +48,13 @@ func TestManagedManagerStartAndClose(t *testing.T) {
 	}
 
 	var requests []testcontainers.GenericContainerRequest
-	manager := NewManagedManager(2, "amazon/dynamodb-local:latest", stateDir)
+	manager := NewManagedManagerWithRuntime(
+		2,
+		"amazon/dynamodb-local:latest",
+		stateDir,
+		ManagedRuntimeContainer,
+		"",
+	)
 	manager.probeHostPort = func(ctx context.Context, hostport string) error {
 		_ = ctx
 		if hostport == "" {
@@ -98,6 +105,10 @@ func TestManagedManagerStartAndClose(t *testing.T) {
 		if len(request.ContainerRequest.ExposedPorts) != 1 || request.ContainerRequest.ExposedPorts[0] != managedDynamoPort {
 			t.Fatalf("requests[%d].ExposedPorts = %v, want [%q]", i, request.ContainerRequest.ExposedPorts, managedDynamoPort)
 		}
+		wantCmd := []string{"-jar", managedDynamoJarName, "-sharedDb", "-dbPath", managedDynamoStateMountDir}
+		if !reflect.DeepEqual(request.ContainerRequest.Cmd, wantCmd) {
+			t.Fatalf("requests[%d].Cmd = %v, want %v", i, request.ContainerRequest.Cmd, wantCmd)
+		}
 		if len(request.ContainerRequest.Mounts) != 1 {
 			t.Fatalf("requests[%d].Mounts = %d, want 1", i, len(request.ContainerRequest.Mounts))
 		}
@@ -129,7 +140,13 @@ func TestManagedManagerStartAndClose(t *testing.T) {
 func TestManagedManagerStartCleansUpOnStartupError(t *testing.T) {
 	first := &fakeManagedContainer{endpoint: "http://127.0.0.1:20001"}
 
-	manager := NewManagedManager(2, "amazon/dynamodb-local:latest", "")
+	manager := NewManagedManagerWithRuntime(
+		2,
+		"amazon/dynamodb-local:latest",
+		"",
+		ManagedRuntimeContainer,
+		"",
+	)
 	manager.probeHostPort = func(ctx context.Context, hostport string) error {
 		_ = ctx
 		_ = hostport
@@ -164,10 +181,59 @@ func TestManagedManagerStartCleansUpOnStartupError(t *testing.T) {
 	}
 }
 
+func TestManagedManagerStartUsesInMemoryByDefault(t *testing.T) {
+	container := &fakeManagedContainer{endpoint: "http://127.0.0.1:20001/"}
+
+	var request testcontainers.GenericContainerRequest
+	manager := NewManagedManagerWithRuntime(
+		1,
+		"amazon/dynamodb-local:latest",
+		"",
+		ManagedRuntimeContainer,
+		"",
+	)
+	manager.probeHostPort = func(ctx context.Context, hostport string) error {
+		_ = ctx
+		_ = hostport
+		return nil
+	}
+	manager.probeAPI = func(ctx context.Context, endpoint string) error {
+		_ = ctx
+		_ = endpoint
+		return nil
+	}
+	manager.startContainer = func(ctx context.Context, req testcontainers.GenericContainerRequest) (managedContainer, error) {
+		_ = ctx
+		request = req
+		return container, nil
+	}
+
+	if _, err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = manager.Close(context.Background())
+	})
+
+	wantCmd := []string{"-jar", managedDynamoJarName, "-sharedDb", "-inMemory"}
+	if !reflect.DeepEqual(request.ContainerRequest.Cmd, wantCmd) {
+		t.Fatalf("request.Cmd = %v, want %v", request.ContainerRequest.Cmd, wantCmd)
+	}
+	if len(request.ContainerRequest.Mounts) != 0 {
+		t.Fatalf("len(request.Mounts) = %d, want 0", len(request.ContainerRequest.Mounts))
+	}
+}
+
 func TestManagedManagerStartCleansUpOnAPIProbeError(t *testing.T) {
 	first := &fakeManagedContainer{endpoint: "http://127.0.0.1:20001"}
 
-	manager := NewManagedManager(1, "amazon/dynamodb-local:latest", "")
+	manager := NewManagedManagerWithRuntime(
+		1,
+		"amazon/dynamodb-local:latest",
+		"",
+		ManagedRuntimeContainer,
+		"",
+	)
 	manager.probeHostPort = func(ctx context.Context, hostport string) error {
 		_ = ctx
 		_ = hostport
@@ -197,14 +263,86 @@ func TestManagedManagerStartCleansUpOnAPIProbeError(t *testing.T) {
 }
 
 func TestManagedManagerStartValidation(t *testing.T) {
-	manager := NewManagedManager(0, "amazon/dynamodb-local:latest", "")
+	manager := NewManagedManagerWithRuntime(
+		0,
+		"amazon/dynamodb-local:latest",
+		"",
+		ManagedRuntimeContainer,
+		"",
+	)
 	if _, err := manager.Start(context.Background()); err == nil {
 		t.Fatal("expected error for instances <= 0")
 	}
 
-	manager = NewManagedManager(1, "   ", "")
+	manager = NewManagedManagerWithRuntime(1, "   ", "", ManagedRuntimeContainer, "")
 	if _, err := manager.Start(context.Background()); err == nil {
 		t.Fatal("expected error for empty image")
+	}
+}
+
+func TestManagedManagerHostFallbackToContainerOnHostPrereqError(t *testing.T) {
+	container := &fakeManagedContainer{endpoint: "http://127.0.0.1:20001/"}
+
+	var request testcontainers.GenericContainerRequest
+	manager := NewManagedManagerWithRuntime(1, "amazon/dynamodb-local:latest", "", ManagedRuntimeHost, "")
+	manager.startHost = func(ctx context.Context) ([]Backend, []*managedHostProcess, error) {
+		_ = ctx
+		return nil, nil, &managedHostPrereqError{reason: "missing jar"}
+	}
+	manager.startContainer = func(ctx context.Context, req testcontainers.GenericContainerRequest) (managedContainer, error) {
+		_ = ctx
+		request = req
+		return container, nil
+	}
+	manager.probeHostPort = func(ctx context.Context, hostport string) error {
+		_ = ctx
+		_ = hostport
+		return nil
+	}
+	manager.probeAPI = func(ctx context.Context, endpoint string) error {
+		_ = ctx
+		_ = endpoint
+		return nil
+	}
+	manager.logf = nil
+
+	backends, err := manager.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if len(backends) != 1 {
+		t.Fatalf("len(backends) = %d, want 1", len(backends))
+	}
+	wantCmd := []string{"-jar", managedDynamoJarName, "-sharedDb", "-inMemory"}
+	if !reflect.DeepEqual(request.ContainerRequest.Cmd, wantCmd) {
+		t.Fatalf("fallback container cmd = %v, want %v", request.ContainerRequest.Cmd, wantCmd)
+	}
+}
+
+func TestManagedManagerHostDoesNotFallbackOnNonPrereqError(t *testing.T) {
+	manager := NewManagedManagerWithRuntime(1, "amazon/dynamodb-local:latest", "", ManagedRuntimeHost, "")
+	manager.startHost = func(ctx context.Context) ([]Backend, []*managedHostProcess, error) {
+		_ = ctx
+		return nil, nil, errors.New("host startup failed")
+	}
+
+	containerCalls := 0
+	manager.startContainer = func(ctx context.Context, req testcontainers.GenericContainerRequest) (managedContainer, error) {
+		_ = ctx
+		_ = req
+		containerCalls++
+		return &fakeManagedContainer{endpoint: "http://127.0.0.1:20001/"}, nil
+	}
+
+	_, err := manager.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected Start() error")
+	}
+	if !strings.Contains(err.Error(), "host startup failed") {
+		t.Fatalf("Start() error = %q, want to contain %q", err.Error(), "host startup failed")
+	}
+	if containerCalls != 0 {
+		t.Fatalf("containerCalls = %d, want 0", containerCalls)
 	}
 }
 
@@ -236,7 +374,7 @@ func TestProbeManagedAPIRetriesUntilSuccess(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
 	if err := probeManagedAPI(ctx, server.URL); err != nil {

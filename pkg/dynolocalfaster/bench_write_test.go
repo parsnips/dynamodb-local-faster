@@ -4,8 +4,12 @@ package dynolocalfaster
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
 	"runtime"
 	"sort"
@@ -17,6 +21,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -43,6 +48,10 @@ const (
 //
 // Configure latency sampling with DLF_BENCH_LATENCY_SAMPLE_RATE, where 1
 // records every request and 10 records every tenth request.
+//
+// Configure request client mode with DLF_BENCH_CLIENT_MODE:
+// - aws-sdk (default)
+// - raw-http (bypasses AWS SDK in hot path)
 func BenchmarkWriteThroughput(b *testing.B) {
 	cpus := runtime.NumCPU()
 	shardInstances := min(10, cpus)
@@ -52,33 +61,35 @@ func BenchmarkWriteThroughput(b *testing.B) {
 
 	workerLevels := benchWorkerSweep(cpus)
 	latencySampleRate := benchLatencySampleRate()
+	clientMode := benchClientMode()
 	b.Logf(
-		"worker levels: %v (shard instances=%d latency sample rate=%d)",
+		"worker levels: %v (shard instances=%d latency sample rate=%d client mode=%s)",
 		workerLevels,
 		shardInstances,
 		latencySampleRate,
+		clientMode,
 	)
 
 	for _, workers := range workerLevels {
 		workers := workers
 		b.Run(fmt.Sprintf("workers-%d", workers), func(b *testing.B) {
-			runSingleBackendComparisons(b, workers, latencySampleRate)
-			runShardedBackendComparisons(b, workers, shardInstances, latencySampleRate)
+			runSingleBackendComparisons(b, workers, latencySampleRate, clientMode)
+			runShardedBackendComparisons(b, workers, shardInstances, latencySampleRate, clientMode)
 		})
 	}
 }
 
-func runSingleBackendComparisons(b *testing.B, workers int, latencySampleRate int) {
+func runSingleBackendComparisons(b *testing.B, workers int, latencySampleRate int, clientMode string) {
 	ctx, cancel := context.WithTimeout(context.Background(), benchClusterTimeout)
 	b.Cleanup(cancel)
 
 	backendsList := startBenchManagedBackends(b, ctx, 1)
-	directClient := newBenchDynamoClient(b, backendsList[0].Endpoint)
+	directClient := newBenchClient(b, backendsList[0].Endpoint, 1, clientMode)
 	proxyServer := startBenchAttachedServer(b, ctx, backendsList)
-	proxyClient := newBenchDynamoClientWithMaxAttempts(b, proxyServer.Endpoint(), 1)
+	proxyClient := newBenchClient(b, proxyServer.Endpoint(), 1, clientMode)
 
-	directTable := setupBenchTableOnClient(b, ctx, directClient, "bench-direct-single")
-	proxyTable := setupBenchTableViaProxy(b, ctx, proxyClient, "bench-proxy-single")
+	directTable := setupBenchTableOnClient(b, ctx, directClient.ddb, "bench-direct-single")
+	proxyTable := setupBenchTableViaProxy(b, ctx, proxyClient.ddb, "bench-proxy-single")
 
 	var directStats benchStats
 	var proxyStats benchStats
@@ -92,7 +103,7 @@ func runSingleBackendComparisons(b *testing.B, workers int, latencySampleRate in
 			"ds-",
 			directTable,
 			&directStats,
-			func(_ string) *dynamodb.Client { return directClient },
+			func(_ string) benchPutter { return directClient.putter },
 		)
 		directStats.report(b, "direct-single-backend")
 	})
@@ -106,27 +117,32 @@ func runSingleBackendComparisons(b *testing.B, workers int, latencySampleRate in
 			"p1-",
 			proxyTable,
 			&proxyStats,
-			func(_ string) *dynamodb.Client { return proxyClient },
+			func(_ string) benchPutter { return proxyClient.putter },
 		)
 		proxyStats.report(b, "proxy-1-instance")
 	})
 }
 
-func runShardedBackendComparisons(b *testing.B, workers int, instances int, latencySampleRate int) {
+func runShardedBackendComparisons(b *testing.B, workers int, instances int, latencySampleRate int, clientMode string) {
 	ctx, cancel := context.WithTimeout(context.Background(), benchClusterTimeout)
 	b.Cleanup(cancel)
 
 	backendsList := startBenchManagedBackends(b, ctx, instances)
-	directClients := make([]*dynamodb.Client, len(backendsList))
+	directClients := make([]benchClient, len(backendsList))
 	for i, backend := range backendsList {
-		directClients[i] = newBenchDynamoClient(b, backend.Endpoint)
+		directClients[i] = newBenchClient(b, backend.Endpoint, 1, clientMode)
 	}
 
 	proxyServer := startBenchAttachedServer(b, ctx, backendsList)
-	proxyClient := newBenchDynamoClientWithMaxAttempts(b, proxyServer.Endpoint(), 1)
+	proxyClient := newBenchClient(b, proxyServer.Endpoint(), 1, clientMode)
 
-	directTable := setupBenchTableOnAllClients(b, ctx, directClients, "bench-direct-sharded")
-	proxyTable := setupBenchTableViaProxy(b, ctx, proxyClient, "bench-proxy-sharded")
+	directDDBClients := make([]*dynamodb.Client, len(directClients))
+	for i, client := range directClients {
+		directDDBClients[i] = client.ddb
+	}
+
+	directTable := setupBenchTableOnAllClients(b, ctx, directDDBClients, "bench-direct-sharded")
+	proxyTable := setupBenchTableViaProxy(b, ctx, proxyClient.ddb, "bench-proxy-sharded")
 
 	var directStats benchStats
 	var proxyStats benchStats
@@ -141,9 +157,9 @@ func runShardedBackendComparisons(b *testing.B, workers int, instances int, late
 			"dn-",
 			directTable,
 			&directStats,
-			func(pk string) *dynamodb.Client {
+			func(pk string) benchPutter {
 				bucket := routeBucketForStringPK(pk, uint64(len(directClients)))
-				return directClients[int(bucket)]
+				return directClients[int(bucket)].putter
 			},
 		)
 		directStats.report(b, directName)
@@ -159,10 +175,83 @@ func runShardedBackendComparisons(b *testing.B, workers int, instances int, late
 			"pn-",
 			proxyTable,
 			&proxyStats,
-			func(_ string) *dynamodb.Client { return proxyClient },
+			func(_ string) benchPutter { return proxyClient.putter },
 		)
 		proxyStats.report(b, proxyName)
 	})
+}
+
+type benchPutter interface {
+	Put(ctx context.Context, table, pk string) error
+}
+
+type benchClient struct {
+	ddb    *dynamodb.Client
+	putter benchPutter
+}
+
+type sdkBenchPutter struct {
+	client *dynamodb.Client
+}
+
+func (p *sdkBenchPutter) Put(ctx context.Context, table, pk string) error {
+	_, err := p.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: map[string]types.AttributeValue{
+			"pk":      &types.AttributeValueMemberS{Value: pk},
+			"payload": &types.AttributeValueMemberS{Value: "bench-payload"},
+		},
+	})
+	return err
+}
+
+type rawHTTPBenchPutter struct {
+	url      string
+	client   *http.Client
+	signer   *v4.Signer
+	creds    aws.Credentials
+	region   string
+	service  string
+	targetOp string
+}
+
+func (p *rawHTTPBenchPutter) Put(ctx context.Context, table, pk string) error {
+	var bodyBuilder strings.Builder
+	bodyBuilder.Grow(len(table) + len(pk) + 96)
+	bodyBuilder.WriteString(`{"TableName":"`)
+	bodyBuilder.WriteString(table)
+	bodyBuilder.WriteString(`","Item":{"pk":{"S":"`)
+	bodyBuilder.WriteString(pk)
+	bodyBuilder.WriteString(`"},"payload":{"S":"bench-payload"}}}`)
+
+	body := bodyBuilder.String()
+	bodyHash := sha256.Sum256([]byte(body))
+	payloadHash := hex.EncodeToString(bodyHash[:])
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	request.Header.Set("X-Amz-Target", p.targetOp)
+	if err := p.signer.SignHTTP(ctx, p.creds, request, payloadHash, p.service, p.region, time.Now().UTC()); err != nil {
+		return err
+	}
+
+	response, err := p.client.Do(request)
+	if err != nil {
+		return err
+	}
+	responseBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		if len(responseBody) > 512 {
+			responseBody = responseBody[:512]
+		}
+		return fmt.Errorf("unexpected status %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+	return nil
 }
 
 type benchLatencySummary struct {
@@ -180,7 +269,7 @@ func runBenchPutParallel(
 	keyPrefix string,
 	tableName string,
 	stats *benchStats,
-	pickClient func(pk string) *dynamodb.Client,
+	pickPutter func(pk string) benchPutter,
 ) {
 	b.Helper()
 
@@ -210,7 +299,7 @@ func runBenchPutParallel(
 
 				pk := keyPrefix + strconv.FormatInt(stats.seq.Add(1), 10)
 				startedAt := time.Now()
-				benchPutItem(ctx, pickClient(pk), tableName, pk, stats)
+				benchPutItem(ctx, pickPutter(pk), tableName, pk, stats)
 				localCount++
 				if localCount%sampleEvery == 0 {
 					localSamples = append(localSamples, time.Since(startedAt).Nanoseconds())
@@ -331,15 +420,9 @@ func (s *benchStats) report(b *testing.B, label string) {
 
 // benchPutItem executes a PutItem with retries to tolerate transient connection
 // resets under heavy concurrency (DynamoDB Local is single-threaded per process).
-func benchPutItem(ctx context.Context, client *dynamodb.Client, table, pk string, stats *benchStats) {
+func benchPutItem(ctx context.Context, putter benchPutter, table, pk string, stats *benchStats) {
 	for attempt := range benchPutRetries {
-		_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
-			TableName: aws.String(table),
-			Item: map[string]types.AttributeValue{
-				"pk":      &types.AttributeValueMemberS{Value: pk},
-				"payload": &types.AttributeValueMemberS{Value: "bench-payload"},
-			},
-		})
+		err := putter.Put(ctx, table, pk)
 		if err == nil {
 			if attempt > 0 {
 				stats.retries.Add(int64(attempt))
@@ -356,7 +439,9 @@ func benchPutItem(ctx context.Context, client *dynamodb.Client, table, pk string
 func startBenchManagedBackends(b *testing.B, ctx context.Context, instances int) []backendspkg.Backend {
 	b.Helper()
 
-	manager := backendspkg.NewManagedManager(instances, DefaultDynamoImage, b.TempDir())
+	// Benchmarks do not need persisted backend state; avoid host bind mounts to
+	// reduce filesystem overhead in write-heavy runs.
+	manager := backendspkg.NewManagedManager(instances, DefaultDynamoImage, "")
 	backendsList, err := manager.Start(ctx)
 	if err != nil {
 		b.Fatalf("managed backends Start(instances=%d) error = %v", instances, err)
@@ -402,11 +487,7 @@ func startBenchAttachedServer(b *testing.B, ctx context.Context, backendsList []
 	return server
 }
 
-func newBenchDynamoClient(b *testing.B, endpoint string) *dynamodb.Client {
-	return newBenchDynamoClientWithMaxAttempts(b, endpoint, 0)
-}
-
-func newBenchDynamoClientWithMaxAttempts(b *testing.B, endpoint string, maxAttempts int) *dynamodb.Client {
+func newBenchClient(b *testing.B, endpoint string, maxAttempts int, clientMode string) benchClient {
 	b.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -426,9 +507,34 @@ func newBenchDynamoClientWithMaxAttempts(b *testing.B, endpoint string, maxAttem
 		b.Fatalf("LoadDefaultConfig() error = %v", err)
 	}
 
-	return dynamodb.NewFromConfig(cfg, func(options *dynamodb.Options) {
+	ddbClient := dynamodb.NewFromConfig(cfg, func(options *dynamodb.Options) {
 		options.BaseEndpoint = aws.String(endpoint)
 	})
+
+	var putter benchPutter
+	switch clientMode {
+	case "raw-http":
+		creds, credsErr := cfg.Credentials.Retrieve(context.Background())
+		if credsErr != nil {
+			b.Fatalf("Retrieve credentials for raw-http bench client error = %v", credsErr)
+		}
+		putter = &rawHTTPBenchPutter{
+			url:      strings.TrimRight(endpoint, "/") + "/",
+			client:   httpx.NewPooledClient(30 * time.Second),
+			signer:   v4.NewSigner(),
+			creds:    creds,
+			region:   cfg.Region,
+			service:  "dynamodb",
+			targetOp: "DynamoDB_20120810.PutItem",
+		}
+	default:
+		putter = &sdkBenchPutter{client: ddbClient}
+	}
+
+	return benchClient{
+		ddb:    ddbClient,
+		putter: putter,
+	}
 }
 
 func setupBenchTableViaProxy(b *testing.B, ctx context.Context, client *dynamodb.Client, prefix string) string {
@@ -559,6 +665,16 @@ func benchLatencySampleRate() int {
 		return 1
 	}
 	return value
+}
+
+func benchClientMode() string {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("DLF_BENCH_CLIENT_MODE")))
+	switch raw {
+	case "raw-http", "rawhttp", "raw":
+		return "raw-http"
+	default:
+		return "aws-sdk"
+	}
 }
 
 func uniqueSortedPositive(input []int) []int {
