@@ -52,12 +52,12 @@ const (
 // Configure request client mode with DLF_BENCH_CLIENT_MODE:
 // - aws-sdk (default)
 // - raw-http (bypasses AWS SDK in hot path)
+//
+// Configure sharded benchmark instance count with DLF_BENCH_SHARD_INSTANCES.
+// Default is min(10, NumCPU()), with a floor of 2.
 func BenchmarkWriteThroughput(b *testing.B) {
 	cpus := runtime.NumCPU()
-	shardInstances := min(10, cpus)
-	if shardInstances < 2 {
-		shardInstances = 2
-	}
+	shardInstances := benchShardInstances(cpus)
 
 	workerLevels := benchWorkerSweep(cpus)
 	latencySampleRate := benchLatencySampleRate()
@@ -653,6 +653,28 @@ func benchWorkerSweep(cpus int) []int {
 
 	levels := []int{1, cpus, cpus * 2}
 	return uniqueSortedPositive(levels)
+}
+
+func benchShardInstances(cpus int) int {
+	if cpus <= 0 {
+		cpus = 1
+	}
+
+	defaultInstances := min(10, cpus)
+	if defaultInstances < 2 {
+		defaultInstances = 2
+	}
+
+	raw := strings.TrimSpace(os.Getenv("DLF_BENCH_SHARD_INSTANCES"))
+	if raw == "" {
+		return defaultInstances
+	}
+
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 2 {
+		return defaultInstances
+	}
+	return value
 }
 
 func benchLatencySampleRate() int {

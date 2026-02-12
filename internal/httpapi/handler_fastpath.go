@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -85,6 +86,9 @@ func (h *Handler) getOrCreateProxy(target backends.Backend) *httputil.ReversePro
 			req.URL.Scheme = targetURL.Scheme
 			req.URL.Host = targetURL.Host
 			req.Host = targetURL.Host
+			if targetURL.Path != "" {
+				req.URL.Path = targetURL.Path + req.URL.Path
+			}
 		},
 		Transport:  h.client.Transport,
 		BufferPool: sharedProxyBufferPool,
@@ -167,6 +171,11 @@ func (h *Handler) tryFastPathSingleItem(w http.ResponseWriter, r *http.Request, 
 	proxy := h.getOrCreateProxy(target)
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
+	if h.client.Timeout > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), h.client.Timeout)
+		defer cancel()
+		r = r.WithContext(ctx)
+	}
 	proxy.ServeHTTP(w, r)
 	return true
 }
@@ -202,7 +211,12 @@ func hasDuplicateTopLevelKey(body []byte, key1, key2 string) bool {
 		}
 
 		// Compare without allocation (Go optimizes string([]byte) == string).
+		// If the key contains escape sequences (e.g. \u004E for 'N'), raw
+		// byte comparison is unreliable. Fall through to full-parse path.
 		keyBytes := body[keyStart:keyEnd]
+		if bytes.IndexByte(keyBytes, '\\') >= 0 {
+			return true
+		}
 		if string(keyBytes) == key1 {
 			if saw1 {
 				return true

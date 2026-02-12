@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/parsnips/dynamodb-local-faster/internal/backends"
 	"github.com/parsnips/dynamodb-local-faster/internal/catalog"
@@ -511,6 +512,203 @@ func TestFastPathSpecialCharPKAttribute(t *testing.T) {
 
 	if status := recorder.Code; status != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body = %s", status, http.StatusOK, recorder.Body.String())
+	}
+}
+
+func TestFastPathRespectsClientTimeout(t *testing.T) {
+	// The fast path must honour h.client.Timeout even though it uses
+	// httputil.ReverseProxy (which only receives the Transport).
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer backend.Close()
+
+	sr, _ := router.NewStaticRouter([]backends.Backend{
+		{ID: 0, Endpoint: backend.URL},
+	})
+	sr.RememberPartitionKey("users", "pk")
+
+	handler := NewHandler(
+		sr,
+		catalog.NewNoopReplicator(),
+		streams.NewNoopMux(),
+		partiql.NewNoopParser(),
+	)
+	// Set a very short timeout that the backend will exceed.
+	handler.client.Timeout = 25 * time.Millisecond
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/",
+		strings.NewReader(`{"TableName":"users","Key":{"pk":{"S":"u-1"}}}`),
+	)
+	req.Header.Set("X-Amz-Target", "DynamoDB_20120810.GetItem")
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if status := recorder.Code; status != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d (timeout should trigger error); body = %s",
+			status, http.StatusBadGateway, recorder.Body.String())
+	}
+}
+
+func TestFastPathPreservesEndpointPathPrefix(t *testing.T) {
+	// Backend endpoints may include a path prefix (e.g. http://host/base).
+	// The fast path must prepend it to the request path.
+	var receivedPath string
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer backend.Close()
+
+	// Construct endpoint with a path prefix.
+	endpointWithPath := backend.URL + "/base"
+	sr, _ := router.NewStaticRouter([]backends.Backend{
+		{ID: 0, Endpoint: endpointWithPath},
+	})
+	sr.RememberPartitionKey("users", "pk")
+
+	handler := NewHandler(
+		sr,
+		catalog.NewNoopReplicator(),
+		streams.NewNoopMux(),
+		partiql.NewNoopParser(),
+	)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/",
+		strings.NewReader(`{"TableName":"users","Key":{"pk":{"S":"u-1"}}}`),
+	)
+	req.Header.Set("X-Amz-Target", "DynamoDB_20120810.GetItem")
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if status := recorder.Code; status != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", status, http.StatusOK, recorder.Body.String())
+	}
+	if receivedPath != "/base/" {
+		t.Fatalf("backend received path %q, want %q", receivedPath, "/base/")
+	}
+}
+
+func TestFastPathFallbackOnEscapedDuplicateKeys(t *testing.T) {
+	// Semantically equivalent escaped keys (e.g. "Key" + "Ke\u0079")
+	// must trigger a fall-through to the full-parse path.
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			"escaped_Key_unicode",
+			`{"TableName":"users","Key":{"pk":{"S":"a"}},"Ke\u0079":{"pk":{"S":"b"}}}`,
+		},
+		{
+			"escaped_TableName_unicode",
+			`{"Table\u004Eame":"users","TableName":"orders","Key":{"pk":{"S":"u-1"}}}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer backend.Close()
+
+			sr, _ := router.NewStaticRouter([]backends.Backend{
+				{ID: 0, Endpoint: backend.URL},
+				{ID: 1, Endpoint: backend.URL},
+			})
+			sr.RememberPartitionKey("users", "pk")
+			sr.RememberPartitionKey("orders", "pk")
+
+			handler := NewHandler(
+				sr,
+				catalog.NewNoopReplicator(),
+				streams.NewNoopMux(),
+				partiql.NewNoopParser(),
+			)
+
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/",
+				strings.NewReader(tc.body),
+			)
+			req.Header.Set("X-Amz-Target", "DynamoDB_20120810.GetItem")
+			req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+
+			// Should still succeed via the full-parse path.
+			if status := recorder.Code; status != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body = %s", status, http.StatusOK, recorder.Body.String())
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("calls = %d, want 1 (full-parse path)", got)
+			}
+		})
+	}
+}
+
+func TestHasDuplicateTopLevelKeyEscaped(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		key1 string
+		key2 string
+		want bool
+	}{
+		{
+			"escaped_key2_unicode",
+			`{"TableName":"users","Ke\u0079":{"pk":{"S":"a"}}}`,
+			"TableName", "Key",
+			true, // conservative: escaped key triggers fall-through
+		},
+		{
+			"escaped_key1_unicode",
+			`{"Table\u004Eame":"users","Key":{"pk":{"S":"a"}}}`,
+			"TableName", "Key",
+			true,
+		},
+		{
+			"escape_in_unrelated_key",
+			`{"Table\u004Eame":"users","Key":{"pk":{"S":"a"}}}`,
+			"Foo", "Bar",
+			true, // any escaped key triggers conservative fall-through
+		},
+		{
+			"backslash_in_value_not_key",
+			`{"TableName":"us\\ers","Key":{"pk":{"S":"a"}}}`,
+			"TableName", "Key",
+			false, // backslash is in the value, not the key
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hasDuplicateTopLevelKey([]byte(tc.body), tc.key1, tc.key2)
+			if got != tc.want {
+				t.Fatalf("hasDuplicateTopLevelKey(%q, %q, %q) = %v, want %v",
+					tc.body, tc.key1, tc.key2, got, tc.want)
+			}
+		})
 	}
 }
 
