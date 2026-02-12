@@ -516,8 +516,7 @@ func TestFastPathSpecialCharPKAttribute(t *testing.T) {
 }
 
 func TestFastPathRespectsClientTimeout(t *testing.T) {
-	// The fast path must honour h.client.Timeout even though it uses
-	// httputil.ReverseProxy (which only receives the Transport).
+	// The fast path must honour h.client.Timeout via h.client.Do.
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/x-amz-json-1.0")

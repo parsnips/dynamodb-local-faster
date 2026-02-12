@@ -254,6 +254,46 @@ func (p *rawHTTPBenchPutter) Put(ctx context.Context, table, pk string) error {
 	return nil
 }
 
+type unsignedHTTPBenchPutter struct {
+	url      string
+	client   *http.Client
+	targetOp string
+}
+
+func (p *unsignedHTTPBenchPutter) Put(ctx context.Context, table, pk string) error {
+	var bodyBuilder strings.Builder
+	bodyBuilder.Grow(len(table) + len(pk) + 96)
+	bodyBuilder.WriteString(`{"TableName":"`)
+	bodyBuilder.WriteString(table)
+	bodyBuilder.WriteString(`","Item":{"pk":{"S":"`)
+	bodyBuilder.WriteString(pk)
+	bodyBuilder.WriteString(`"},"payload":{"S":"bench-payload"}}}`)
+
+	body := bodyBuilder.String()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	request.Header.Set("X-Amz-Target", p.targetOp)
+	request.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=local/20000101/us-west-2/dynamodb/aws4_request, SignedHeaders=content-type;host;x-amz-target, Signature=0000000000000000000000000000000000000000000000000000000000000000")
+
+	response, err := p.client.Do(request)
+	if err != nil {
+		return err
+	}
+	responseBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		if len(responseBody) > 512 {
+			responseBody = responseBody[:512]
+		}
+		return fmt.Errorf("unexpected status %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+	return nil
+}
+
 type benchLatencySummary struct {
 	sampleCount int
 	p50NS       int64
@@ -513,6 +553,12 @@ func newBenchClient(b *testing.B, endpoint string, maxAttempts int, clientMode s
 
 	var putter benchPutter
 	switch clientMode {
+	case "unsigned":
+		putter = &unsignedHTTPBenchPutter{
+			url:      strings.TrimRight(endpoint, "/") + "/",
+			client:   httpx.NewPooledClient(30 * time.Second),
+			targetOp: "DynamoDB_20120810.PutItem",
+		}
 	case "raw-http":
 		creds, credsErr := cfg.Credentials.Retrieve(context.Background())
 		if credsErr != nil {
@@ -692,6 +738,8 @@ func benchLatencySampleRate() int {
 func benchClientMode() string {
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv("DLF_BENCH_CLIENT_MODE")))
 	switch raw {
+	case "unsigned", "nosign":
+		return "unsigned"
 	case "raw-http", "rawhttp", "raw":
 		return "raw-http"
 	default:

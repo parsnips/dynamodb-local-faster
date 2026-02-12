@@ -13,7 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
+
 	"time"
 	"unicode"
 
@@ -54,12 +54,11 @@ const (
 )
 
 type Handler struct {
-	router         router.BackendRouter
-	catalog        catalog.CatalogReplicator
-	streams        streams.StreamMux
-	parser         partiql.Parser
-	client         *http.Client
-	reverseProxies sync.Map // map[int]*httputil.ReverseProxy, lazily cached per backend
+	router  router.BackendRouter
+	catalog catalog.CatalogReplicator
+	streams streams.StreamMux
+	parser  partiql.Parser
+	client  *http.Client
 }
 
 type proxiedResponse struct {
@@ -1900,11 +1899,35 @@ func cloneHeader(header http.Header) http.Header {
 	return cloned
 }
 
+// dummyAuthHeader is a static Authorization header injected into proxied
+// requests. DynamoDB Local requires the header to exist but does not
+// validate the signature, so we replace whatever the client sent (or
+// nothing) with a cheap constant. This lets clients skip SigV4 signing
+// entirely while keeping backends happy.
+const dummyAuthHeader = "AWS4-HMAC-SHA256 Credential=local/20000101/us-east-1/dynamodb/aws4_request, SignedHeaders=content-type;host;x-amz-target, Signature=0000000000000000000000000000000000000000000000000000000000000000"
+
+// copyHeader forwards headers to the backend, replacing SigV4 signing
+// headers with a single static dummy Authorization.
 func copyHeader(dst http.Header, src http.Header) {
 	for key, values := range src {
+		if isSigningHeader(key) {
+			continue
+		}
 		for _, value := range values {
 			dst.Add(key, value)
 		}
+	}
+	dst.Set("Authorization", dummyAuthHeader)
+}
+
+// isSigningHeader reports whether the header is part of SigV4 signing
+// and should be replaced with the dummy Authorization.
+func isSigningHeader(key string) bool {
+	switch key {
+	case "Authorization", "X-Amz-Date", "X-Amz-Security-Token", "X-Amz-Content-Sha256":
+		return true
+	default:
+		return false
 	}
 }
 

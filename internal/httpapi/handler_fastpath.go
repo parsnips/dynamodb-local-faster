@@ -2,13 +2,10 @@ package httpapi
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"strings"
 	"sync"
 
@@ -38,19 +35,11 @@ var bodyPool = sync.Pool{
 	New: func() any { return bytes.NewBuffer(make([]byte, 0, 4096)) },
 }
 
-// proxyBufferPool implements httputil.BufferPool using sync.Pool.
-type proxyBufferPool struct {
-	pool sync.Pool
+// respBodyPool holds reusable buffers for reading backend response bodies
+// in proxyToBackendDirect.
+var respBodyPool = sync.Pool{
+	New: func() any { return bytes.NewBuffer(make([]byte, 0, 4096)) },
 }
-
-var sharedProxyBufferPool = &proxyBufferPool{
-	pool: sync.Pool{
-		New: func() any { return make([]byte, 32*1024) },
-	},
-}
-
-func (p *proxyBufferPool) Get() []byte  { return p.pool.Get().([]byte) }
-func (p *proxyBufferPool) Put(b []byte) { p.pool.Put(b) }
 
 // putPoolBuffer returns a buffer to its pool if it hasn't grown too large.
 func putPoolBuffer(pool *sync.Pool, buf *bytes.Buffer) {
@@ -69,38 +58,6 @@ func readBody(r io.Reader) (*bytes.Buffer, error) {
 		return nil, err
 	}
 	return buf, nil
-}
-
-// getOrCreateProxy returns a cached httputil.ReverseProxy for the given
-// backend, creating one on first use. Proxies stream responses directly
-// to the client without intermediate body buffering.
-func (h *Handler) getOrCreateProxy(target backends.Backend) *httputil.ReverseProxy {
-	if v, ok := h.reverseProxies.Load(target.ID); ok {
-		return v.(*httputil.ReverseProxy)
-	}
-
-	targetURL, _ := url.Parse(strings.TrimRight(target.Endpoint, "/"))
-
-	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = targetURL.Scheme
-			req.URL.Host = targetURL.Host
-			req.Host = targetURL.Host
-			if targetURL.Path != "" {
-				req.URL.Path = targetURL.Path + req.URL.Path
-			}
-		},
-		Transport:  h.client.Transport,
-		BufferPool: sharedProxyBufferPool,
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			op := operationFromTarget(r.Header.Get("X-Amz-Target"))
-			writeDynamoError(w, http.StatusBadGateway, "InternalServerError",
-				fmt.Sprintf("proxy %s to backend %d at %s: %v", op, target.ID, target.Endpoint, err))
-		},
-	}
-
-	actual, _ := h.reverseProxies.LoadOrStore(target.ID, proxy)
-	return actual.(*httputil.ReverseProxy)
 }
 
 // tryFastPathSingleItem attempts to route a single-item operation using gjson
@@ -167,17 +124,59 @@ func (h *Handler) tryFastPathSingleItem(w http.ResponseWriter, r *http.Request, 
 		return false
 	}
 
-	// Proxy via cached ReverseProxy (streams response directly to client).
-	proxy := h.getOrCreateProxy(target)
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
-	if h.client.Timeout > 0 {
-		ctx, cancel := context.WithTimeout(r.Context(), h.client.Timeout)
-		defer cancel()
-		r = r.WithContext(ctx)
+	// Proxy the original body unchanged via h.client (inherits timeout).
+	if err := h.proxyToBackendDirect(w, r, target, body); err != nil {
+		writeDynamoError(w, http.StatusBadGateway, "InternalServerError", err.Error())
 	}
-	proxy.ServeHTTP(w, r)
 	return true
+}
+
+// proxyToBackendDirect sends body to the target backend and writes the
+// response directly to w. Buffers the response body so w.Write sends the
+// complete payload in one call, letting net/http compute Content-Length and
+// write the response in a single TCP frame. Uses h.client.Do which inherits
+// the configured timeout.
+func (h *Handler) proxyToBackendDirect(w http.ResponseWriter, original *http.Request, target backends.Backend, body []byte) error {
+	targetURL := strings.TrimRight(target.Endpoint, "/") + original.URL.Path
+	if original.URL.RawQuery != "" {
+		targetURL += "?" + original.URL.RawQuery
+	}
+
+	req, err := http.NewRequestWithContext(original.Context(), original.Method, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build proxy request: %w", err)
+	}
+	copyHeader(req.Header, original.Header)
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("proxy %s to backend %d at %s: %w",
+			operationFromTarget(original.Header.Get("X-Amz-Target")), target.ID, target.Endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body into a pooled buffer.
+	respBuf := respBodyPool.Get().(*bytes.Buffer)
+	respBuf.Reset()
+	defer putPoolBuffer(&respBodyPool, respBuf)
+
+	if _, err := respBuf.ReadFrom(resp.Body); err != nil {
+		return fmt.Errorf("read backend response: %w", err)
+	}
+
+	// Write response headers directly to w (no intermediate clone).
+	wh := w.Header()
+	for key, values := range resp.Header {
+		if shouldSkipResponseHeader(key) {
+			continue
+		}
+		for _, value := range values {
+			wh.Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBuf.Bytes())
+	return nil
 }
 
 // hasDuplicateTopLevelKey reports whether body (which must be valid JSON)
